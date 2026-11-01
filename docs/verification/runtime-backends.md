@@ -3656,9 +3656,26 @@ No app executable or connected GUI was available on this host, so rendered neste
 This change uses no harness-output classifier, status synthesis, or UI modification.
 Other runtime backends and harness launch commands retain their existing behavior; the hc create path alone consumes the task kind.
 
+### Native remote socket path
+
+Measured on 2026-11-01 with hc 0.1.16 on Linux aarch64.
+`bash bin/fm-test-run.sh tests/fm-backend-hc-smoke.test.sh` passed under the same external mount/PID/network boundary and lab/safety owners described above, including guarded teardown with exit 0.
+The native remote adapter checked the permanent core ID on the same existing Unix connection as each operation.
+The real host-local remote controller returned a complete receipt, captured the terminal with its creating owner's labels, and stored repeated identical steers as one durable inbox record.
+
+```text
+ok - native remote control: exact receipt, consistent capture owner, durable deduplicated inbox and wrong-core preservation
+ok - native existing-socket path: real-core create, parent, send/read, wrong-core/home refusal, close and independent child
+FM_TEST_COMPLETE
+```
+
+This used shell terminals and a local transport delegate, not a credentialed cross-host Codex supervisor.
+`tests/fm-hc-screen.test.sh` covers missing sockets, wrong cores, disconnect after dispatch, core replacement between operations and stable `error.data.kind` decoding through a real Unix socket fixture.
+The remote seed, relaunch and transport fixtures cover explicit placement, immutable bindings, complete receipts and fail-closed routing without claiming real device readiness.
+
 ### Not verified
 
 - A ship spawn with a real harness; the credentialed lifecycle guard covers a secondmate.
-- Native secondmate lifecycle with harnesses other than Codex, and remote hc secondmates.
+- Native secondmate lifecycle with harnesses other than Codex, and credentialed cross-host hc secondmates.
 - A persistent away-mode daemon's full long-running loop; its actual guarded injection primitive was exercised.
 - How the `herdr.space` and `herdr.tab` labels display in Herdr.app; label creation and reuse after recovery were verified through the core API.

@@ -933,7 +933,7 @@ nonherdr_parent_rc=$?
 set -e
 [ "$nonherdr_parent_rc" -ne 0 ] || fail "parent accepted a non-herdr remote launch route"
 assert_grep "remote launch returned an invalid or mismatched endpoint/core receipt" "$TMP_ROOT/spawn-nonherdr-route.out" \
-  "parent refusal did not name the returned remote backend"
+  "parent refusal did not identify the mismatched receipt"
 cmp -s "$TMP_ROOT/parent-ios-before-nonherdr.meta" "$PARENT/state/ios.meta" \
   || fail "parent rewrote its endpoint metadata after a non-herdr route refusal"
 cmp -s "$TMP_ROOT/registry-before-nonherdr.md" "$PARENT/data/secondmates.md" \
@@ -945,8 +945,8 @@ FM_FAKE_SSH_MODE=launch-default-session-route remote_env "$ROOT/bin/fm-spawn.sh"
 default_session_parent_rc=$?
 set -e
 [ "$default_session_parent_rc" -ne 0 ] || fail "parent accepted an interactive default-session remote route"
-assert_grep "remote launch returned Herdr session 'default', expected 'fm-remote'" "$TMP_ROOT/spawn-default-session-route.out" \
-  "parent refusal did not name the default session"
+assert_grep "remote launch returned an invalid or mismatched endpoint/core receipt" "$TMP_ROOT/spawn-default-session-route.out" \
+  "parent refusal did not identify the mismatched receipt"
 cmp -s "$TMP_ROOT/parent-ios-before-nonherdr.meta" "$PARENT/state/ios.meta" \
   || fail "parent rewrote its endpoint metadata after a default-session route refusal"
 

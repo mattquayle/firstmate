@@ -601,7 +601,7 @@ check_herdr() {
     return 0
   fi
   record herdr "human: the herdr CLI does not resolve on the remote runtime PATH" \
-    "install herdr from https://herdr.dev on that account, or add a ~/.local/bin wrapper for it; a remote second mate always runs on the Herdr backend"
+    "install herdr from https://herdr.dev on that account, or add a ~/.local/bin wrapper for it; this legacy route requires the Herdr backend"
 }
 
 check_gui_session() {

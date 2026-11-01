@@ -347,6 +347,7 @@ secondmate_remote_receipt_validate() { # <registry> <id> <receipt>
   SECONDMATE_RECEIPT_TARGET=$(secondmate_remote_receipt_value "$receipt" target) || return 1
   [ "$SECONDMATE_RECEIPT_BACKEND" = "$SECONDMATE_REGISTRY_BACKEND" ] || return 1
   if [ "$SECONDMATE_RECEIPT_BACKEND" = hc ]; then
+    [ "$(secondmate_remote_receipt_value "$receipt" harness)" = codex ] || return 1
     session=$(secondmate_remote_receipt_value "$receipt" hc_session) || return 1
     core=$(secondmate_remote_receipt_value "$receipt" hc_core_id) || return 1
     terminal=$(secondmate_remote_receipt_value "$receipt" hc_terminal) || return 1
@@ -368,6 +369,11 @@ secondmate_remote_meta_matches() { # <registry> <id> <parent-meta>
     [ "$(secondmate_remote_receipt_value "$record" home)" = "$SECONDMATE_REGISTRY_HOME" ] &&
     [ "$(secondmate_remote_receipt_value "$record" remote_backend)" = "$SECONDMATE_REGISTRY_BACKEND" ] || return 1
   if [ "$SECONDMATE_REGISTRY_BACKEND" = hc ]; then
+    [ "$(secondmate_remote_receipt_value "$record" kind)" = secondmate ] &&
+      [ "$(secondmate_remote_receipt_value "$record" window)" = "remote:$id" ] &&
+      [ "$(secondmate_remote_receipt_value "$record" endpoint_task_id)" = "$id" ] &&
+      [ "$(secondmate_remote_receipt_value "$record" worktree)" = "$SECONDMATE_REGISTRY_HOME" ] &&
+      [ "$(secondmate_remote_receipt_value "$record" project)" = "$SECONDMATE_REGISTRY_ROOT" ] || return 1
     [ "$(secondmate_remote_receipt_value "$record" remote_hc_session)" = "$SECONDMATE_REGISTRY_HC_SESSION" ] &&
       [ "$(secondmate_remote_receipt_value "$record" remote_hc_core_id)" = "$SECONDMATE_REGISTRY_HC_CORE" ] || return 1
     local terminal

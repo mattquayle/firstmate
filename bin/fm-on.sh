@@ -8,7 +8,9 @@
 # SSH config alias, remote Firstmate code root, and remote FM_HOME. A host alias
 # may be used directly only when exactly one record selects it; an ambiguous
 # alias is refused. The command must be a genuine executable in this checkout's
-# bin/fm-*.sh namespace. No per-command table exists.
+# bin/fm-*.sh namespace. No per-command table exists. Native routes also
+# require any existing parent endpoint receipt to match their bound placement;
+# a changed or incomplete record is refused before SSH, for every command.
 #
 # argv is encoded as one NUL-delimited stream and passed through the fixed
 # fm-remote-entrypoint.sh. The remote command's stdin is /dev/null by default,
@@ -78,6 +80,8 @@ MATCHES=0
 HOST=
 ROOT=
 HOME_PATH=
+MATCHED_ID=
+MATCHED_BACKEND=
 while IFS= read -r line || [ -n "$line" ]; do
   case "$line" in '- '*) ;; *) continue ;; esac
   secondmate_registry_parse_line "$line" || die "malformed secondmate registry entry: $line"
@@ -87,6 +91,8 @@ while IFS= read -r line || [ -n "$line" ]; do
     HOST=$SECONDMATE_REGISTRY_HOST
     ROOT=$SECONDMATE_REGISTRY_ROOT
     HOME_PATH=$SECONDMATE_REGISTRY_HOME
+    MATCHED_ID=$SECONDMATE_REGISTRY_ID
+    MATCHED_BACKEND=$SECONDMATE_REGISTRY_BACKEND
   fi
 done < "$REG"
 [ "$MATCHES" -gt 0 ] || die "no remote secondmate or SSH alias matches '$ROUTE'"
@@ -99,6 +105,14 @@ for configured_path in "$ROOT" "$HOME_PATH"; do
   case "/$configured_path/" in */../*|*/./*) die "configured remote root or home contains traversal components" ;; esac
   case "$configured_path" in *'//'*) die "configured remote root or home contains an empty path component" ;; esac
 done
+
+if [ "$MATCHED_BACKEND" = hc ]; then
+  META="${FM_STATE_OVERRIDE:-$FM_HOME/state}/$MATCHED_ID.meta"
+  if [ -e "$META" ] || [ -L "$META" ]; then
+    secondmate_remote_meta_matches "$REG" "$MATCHED_ID" "$META" \
+      || die "native remote endpoint receipt disagrees with registry; refusing transport"
+  fi
+fi
 
 ROOT_B64=$(printf '%s' "$ROOT" | encode_base64)
 HOME_B64=$(printf '%s' "$HOME_PATH" | encode_base64)

@@ -118,13 +118,7 @@ if grep -qE '^(backend|hc_session|hc_core_id)=' "$TMP/manifest"; then
 fi
 # shellcheck source=bin/fm-secondmate-parent-lib.sh
 . "$SCRIPT_DIR/fm-secondmate-parent-lib.sh"
-if [ -e "$FM_HOME/.fm-secondmate-parent" ] || [ -L "$FM_HOME/.fm-secondmate-parent" ]; then
-  fm_secondmate_parent_record_parse "$FM_HOME/.fm-secondmate-parent" || die "unsafe existing parent binding"
-  [ "$FM_SECONDMATE_PARENT_BACKEND" = "$NATIVE_BACKEND" ] \
-    && [ "$FM_SECONDMATE_PARENT_HC_SESSION" = "$NATIVE_SESSION" ] \
-    && [ "$FM_SECONDMATE_PARENT_HC_CORE" = "$NATIVE_CORE" ] || die "seed cannot migrate an existing endpoint binding"
-  [ "$NATIVE_BACKEND" != hc ] || [ "$FM_SECONDMATE_CONTROL_ROOT" = "$FM_ROOT" ] || die "foreign native control root"
-fi
+
 COUNT=$(manifest_value "$TMP/manifest" project_count || true)
 base64_decode_to "$ID_B64" "$TMP/id" || die "manifest id is not valid base64"
 base64_decode_to "$CHARTER_B64" "$TMP/charter" || die "manifest charter is not valid base64"
@@ -167,6 +161,16 @@ FM_STATE_OVERRIDE="$PROVISION_LOCK_STATE"
 PROVISION_LOCK="$STATE/.remote-home-provision-$HOME_LOCK_KEY.lock"
 fm_lock_acquire_wait "$PROVISION_LOCK"
 PROVISION_LOCK_HELD=1
+
+# Re-read the immutable native binding only after acquiring the home lock.
+# Another provisioning attempt may have published it while this one waited.
+if [ -e "$FM_HOME/.fm-secondmate-parent" ] || [ -L "$FM_HOME/.fm-secondmate-parent" ]; then
+  fm_secondmate_parent_record_parse "$FM_HOME/.fm-secondmate-parent" || die "unsafe existing parent binding"
+  [ "$FM_SECONDMATE_PARENT_BACKEND" = "$NATIVE_BACKEND" ] \
+    && [ "$FM_SECONDMATE_PARENT_HC_SESSION" = "$NATIVE_SESSION" ] \
+    && [ "$FM_SECONDMATE_PARENT_HC_CORE" = "$NATIVE_CORE" ] || die "seed cannot migrate an existing endpoint binding"
+  [ "$NATIVE_BACKEND" != hc ] || [ "$FM_SECONDMATE_CONTROL_ROOT" = "$FM_ROOT" ] || die "foreign native control root"
+fi
 
 if [ -e "$FM_HOME" ] || [ -L "$FM_HOME" ]; then
   [ -d "$FM_HOME" ] && [ ! -L "$FM_HOME" ] || die "remote home exists but is not a safe directory"

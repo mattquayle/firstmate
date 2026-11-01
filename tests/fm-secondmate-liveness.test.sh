@@ -868,7 +868,7 @@ w=$(make_remote_probe_world native-probe)
 sed 's/; scope:/; backend: hc; hc-session: lab; hc-core: coreA; scope:/' "$w/home/data/secondmates.md" > "$w/reg"
 mv "$w/reg" "$w/home/data/secondmates.md"
 sed 's/remote_backend=herdr/remote_backend=hc/; s/remote_target=.*/remote_target=lab:t1/' "$w/home/state/rsm1.meta" > "$w/meta"
-printf 'remote_hc_session=lab\nremote_hc_core_id=coreA\nremote_hc_terminal=t1\n' >> "$w/meta"
+printf 'endpoint_task_id=rsm1\nworktree=/remote/rsm1-home\nproject=/remote/root\nremote_hc_session=lab\nremote_hc_core_id=coreA\nremote_hc_terminal=t1\n' >> "$w/meta"
 mv "$w/meta" "$w/home/state/rsm1.meta"
 out=$(probe_remote "$w" poll FM_FAKE_REMOTE_REPLY=missing)
 assert_contains "$out" 'relaunchable|missing|' 'confirmed native missing state may recover on its host'
@@ -878,6 +878,6 @@ count=$(wc -l < "$w/ssh.log")
 out=$(probe_remote "$w" poll FM_FAKE_REMOTE_REPLY=missing)
 assert_contains "$out" 'remote route metadata disagrees' 'changed core preserves route'
 assert_equals "$count" "$(wc -l < "$w/ssh.log")" 'mismatched native route makes no remote call'
-pass 'native recovery preserves mismatched core identity before contacting any host' 
+pass 'native recovery preserves mismatched core identity before contacting any host'
 
 echo "# all fm-secondmate-liveness tests passed"

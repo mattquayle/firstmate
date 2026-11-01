@@ -545,4 +545,36 @@ set -e
 [ "$(grep -c mutation "$REMOTE_HOME/mutations")" -eq 1 ] || fail "ambiguous mutation did not execute exactly once"
 pass "unreachable and ambiguous transport failures are surfaced without retry"
 
+# Native routes remain generic encoded transport, but an existing receipt
+# must agree before even a read or a mutation reaches the selected host.
+write_registry
+sed 's/; scope:/; backend: hc; hc-session: lab; hc-core: coreA; scope:/' "$LOCAL_HOME/data/secondmates.md" > "$TMP_ROOT/native-reg"
+mv "$TMP_ROOT/native-reg" "$LOCAL_HOME/data/secondmates.md"
+mkdir -p "$LOCAL_HOME/state"
+cat > "$LOCAL_HOME/state/ios.meta" <<EOF
+kind=secondmate
+window=remote:ios
+endpoint_task_id=ios
+worktree=$REMOTE_HOME
+project=$REMOTE_ROOT
+remote_host=remote-mac
+remote_root=$REMOTE_ROOT
+home=$REMOTE_HOME
+remote_backend=hc
+remote_hc_session=lab
+remote_hc_core_id=coreA
+remote_hc_terminal=t1
+remote_target=lab:t1
+EOF
+out=$(fm_on ios fm-probe-two.sh)
+assert_contains "$out" "home=$REMOTE_HOME" 'valid native route uses same transport'
+cp "$LOCAL_HOME/state/ios.meta" "$TMP_ROOT/native-meta"
+for field in remote_host remote_root home remote_hc_core_id remote_hc_session remote_hc_terminal remote_target; do
+  sed "s|^$field=.*|$field=wrong|" "$TMP_ROOT/native-meta" > "$LOCAL_HOME/state/ios.meta"
+  before=$(cat "$SSH_COUNT")
+  if fm_on ios fm-probe-two.sh >/dev/null 2>&1; then fail "accepted wrong native $field"; fi
+  assert_equals "$before" "$(cat "$SSH_COUNT")" 'wrong placement reached SSH'
+done
+pass 'native transport validates every recorded placement dimension before SSH and never falls back locally'
+
 echo "ALL TESTS PASSED"

@@ -22,7 +22,7 @@
 # Native hc operations never start a missing core or inherit a Spark endpoint.
 # fm-spawn/fm-send/fm-teardown keep owning the local endpoint mechanics.
 # The home's own workers keep their ordinary backend selection.
-# bin/fm-remote-doctor.sh owns that host's readiness for Herdr.
+# bin/fm-remote-doctor.sh owns that host's selected-backend readiness.
 # docs/remote-secondmates.md owns why.
 #
 # With <parent-commit>, sync follows the PARENT PRIMARY's default-branch commit,
@@ -128,9 +128,9 @@ remote_endpoint_load() {
   REMOTE_ENDPOINT_TARGET=$FM_BACKEND_VALIDATED_TARGET
   if [ "$REMOTE_ENDPOINT_BACKEND" = hc ] && [ "$NATIVE_ROUTE" = 1 ]; then
     fm_backend_source hc || return 1
-    if [ "$(fm_meta_get "$REMOTE_ENDPOINT_META" kind)" != secondmate ] \
-      || [ "$(fm_meta_get "$REMOTE_ENDPOINT_META" home)" != "$TARGET_HOME" ] \
-      || [ "$(fm_meta_get "$REMOTE_ENDPOINT_META" harness)" != codex ] \
+    if [ "$(fm_backend_meta_exact_value "$REMOTE_ENDPOINT_META" kind)" != secondmate ] \
+      || [ "$(fm_backend_meta_exact_value "$REMOTE_ENDPOINT_META" home)" != "$TARGET_HOME" ] \
+      || [ "$(fm_backend_meta_exact_value "$REMOTE_ENDPOINT_META" harness)" != codex ] \
       || [ "$(fm_meta_get "$REMOTE_ENDPOINT_META" hc_session)" != "$HC_SESSION" ] \
       || [ "$(fm_meta_get "$REMOTE_ENDPOINT_META" hc_core_id)" != "$FM_HC_EXPECT_CORE" ] \
       || ! fm_backend_hc_record_matches_core "$REMOTE_ENDPOINT_META"; then

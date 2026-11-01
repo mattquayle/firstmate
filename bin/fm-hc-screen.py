@@ -66,7 +66,7 @@ class ExistingCore:
 
     def call(self, method, params):
         self.sequence += 1
-        self.stdin.write((json.dumps(dict(jsonrpc="2.0", id=self.sequence, method=method, params=params)) + "\n").encode())
+        self.socket.sendall((json.dumps(dict(jsonrpc="2.0", id=self.sequence, method=method, params=params)) + "\n").encode())
         line = self.stdout.readline(1048577)
         if not line.endswith(b"\n") or len(line) > 1048576:
             raise ValueError("incomplete or oversized hc reply; completion unknown")

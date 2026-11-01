@@ -22,7 +22,7 @@ def read(n):
     return out
 hello=json.loads(src.readline())
 assert hello['params']==dict(generation=1,framed=True)
-dst.write(b'{"result":{"generation":1,"framed":true}}\n'); dst.flush()
+dst.write((json.dumps(dict(id=hello.get('id'), result=dict(generation=1,framed=True,core=dict(id=os.environ.get('HELLO_CORE','coreA')))))+'\n').encode()); dst.flush()
 terminal=dict(address='t1',state='live',labels={'firstmate.home':'test','firstmate.task':'fm-mate'},cols=80,rows=24)
 text='› Ask Codex to do anything\n\n  GPT-6.1-Sol low · /work\n  ? for shortcuts'
 styled='› \x1b[2mAsk Codex to do anything\x1b[0m\r\n\r\n  GPT-6.1-Sol low · /work\r\n  ? for shortcuts'
@@ -125,6 +125,9 @@ for args, method, fields in [
     assert proc.returncode == 0, proc.stderr
     assert len(seen) == 1 and seen[0]["method"] == method, seen
     assert fields.items() <= seen[0]["params"].items(), seen
+large="opaque" * 10000
+proc, seen = call(["send", "t1", "--", large])
+assert proc.returncode==0 and seen[0]["params"]["text"]==large
 proc, seen = call(["send", "t1", "--", "never sent"], core="otherCore")
 assert proc.returncode != 0 and not seen
 proc, seen = call(["send", "t1", "--", "one send"], disconnect=True)
@@ -140,5 +143,27 @@ for args in (["get", "t1"], ["server", "stop"], ["run", "--bg", "--cwd", "/scrat
     proc = subprocess.run([sys.executable, helper, "--cli", "lab", "coreA", *args], env=env, capture_output=True, timeout=5)
     assert proc.returncode != 0 and not path.exists()
 print("ok - existing-socket RPC pins identity per connection, refuses remote addresses/lifecycle, and never retries unknown completion")
+# Reuse the independently checked framed fixture across an actual Unix socket.
+# The observer must preserve style and refuse concurrent/foreign paints after
+# the same-connection native identity handshake, without launching hc itself.
+for mode in ("idle", "pending", "foreign", "update", "truncated", "mismatch", "wrong-core"):
+    server=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM)
+    server.bind(str(path)); server.listen(1); server.settimeout(5)
+    fixture_env=dict(env, CASE=mode, HELLO_CORE="other" if mode=="wrong-core" else "coreA")
+    def framed():
+        conn, _=server.accept()
+        with conn:
+            subprocess.run([str(root / "hc")], stdin=conn, stdout=conn, stderr=subprocess.PIPE, env=fixture_env, timeout=8, check=True)
+        server.close()
+    thread=threading.Thread(target=framed); thread.start()
+    proc=subprocess.run([sys.executable, helper, "/must-not-launch-hc", "lab", "t1", "test", "fm-mate"],
+        env=dict(env, FM_HC_EXPECT_CORE="coreA", FM_HC_SOCKET=str(path)), capture_output=True, timeout=10)
+    thread.join(10); path.unlink()
+    assert not thread.is_alive()
+    if mode in ("idle", "pending"):
+        assert proc.returncode==0 and b"Ask Codex" in proc.stdout, proc.stderr
+    else:
+        assert proc.returncode!=0 and not proc.stdout, mode
+print("ok - native framed observation validates the core on its own socket and preserves all screen refusal guards")
 PYTEST
 echo FM_TEST_COMPLETE

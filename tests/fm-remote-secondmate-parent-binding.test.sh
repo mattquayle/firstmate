@@ -60,9 +60,10 @@ cleanup() {
     "$ROOT/bin/fm-procevent.sh" sweep-home >/dev/null 2>&1 || true
   if [ -f "$TMP_ROOT/remote-jobs/worker.pid" ]; then
     worker_pid=$(cat "$TMP_ROOT/remote-jobs/worker.pid")
-    kill "$worker_pid" 2>/dev/null || true
+    . "$ROOT/bin/fm-remote-job-lib.sh"
+    fm_remote_job_stop_worker_tree "$worker_pid" || true
   fi
-  rm -rf -- "$TMP_ROOT"
+  fm_test_remove_tree "$TMP_ROOT"
 }
 trap cleanup EXIT
 
@@ -171,6 +172,8 @@ IFS=$'\t' read -r command_name _command_action command_rel <<EOF
 $command_fields
 EOF
 if [ "$command_name" = fm-remote-doctor.sh ]; then
+  printf '%s\n' "${_command_action:--}" >> "$FM_FAKE_DOCTOR_LOG"
+  [ "${FM_TEST_NATIVE_GAP:-0}" != 1 ] || { printf 'native fixture gap\n'; exit 1; }
   printf 'check herdr=ok: /usr/bin/herdr\n'
   printf 'ok: remote second-mate readiness confirmed on this host\n'
   exit 0
@@ -325,5 +328,74 @@ cmp -s "$FOREIGN_META" <(printf 'foreign sentinel\n') \
 [ -L "$LOCAL_META" ] \
   || fail "remote secondmate publication replaced the refused target boundary"
 pass "remote secondmate publication refuses targets outside its home"
+
+# Explicit native selection traverses the same seed, manifest, encoded SSH
+# entrypoint and account worker. The doctor is stubbed at SSH above; this
+# proves placement and provisioning, not real-core or harness readiness.
+NATIVE_HOME="$TMP_ROOT/native-home"
+: > "$DOCTOR_LOG"
+FM_SECONDMATE_CHARTER='Own isolated native remote work.' FM_SECONDMATE_SCOPE='native test' FM_TEST_NATIVE_GAP=1 \
+  remote_env "$ROOT/bin/fm-remote-home-seed.sh" native remote-mac "$REMOTE_ROOT" "$NATIVE_HOME" \
+    --backend hc --hc-session lab --hc-core-id coreA --no-projects > "$TMP_ROOT/native-gap" 2>&1
+native_rc=$?
+[ "$native_rc" -ne 0 ] || fail 'native readiness gap accepted'
+assert_equals --backend "$(cat "$DOCTOR_LOG")" 'native readiness makes one check and no automatic fix'
+assert_absent "$NATIVE_HOME" 'native readiness refusal seeded a home'
+FM_SECONDMATE_CHARTER='Own isolated native remote work.' FM_SECONDMATE_SCOPE='native test' \
+  remote_env "$ROOT/bin/fm-remote-home-seed.sh" native remote-mac "$REMOTE_ROOT" "$NATIVE_HOME" \
+    --backend hc --hc-session lab --hc-core-id coreA --no-projects > "$TMP_ROOT/native-seed" 2>&1 \
+  || { cat "$TMP_ROOT/native-seed"; fail 'native seed failed'; }
+. "$ROOT/bin/fm-secondmate-parent-lib.sh"
+fm_secondmate_parent_record_parse "$NATIVE_HOME/.fm-secondmate-parent" || fail 'native parent binding invalid'
+assert_equals hc "$FM_SECONDMATE_PARENT_BACKEND" 'seeded backend'
+assert_equals "$REMOTE_ROOT" "$FM_SECONDMATE_CONTROL_ROOT" 'host-local control root binding'
+assert_equals coreA "$FM_SECONDMATE_PARENT_HC_CORE" 'permanent core binding'
+assert_equals lab "$FM_SECONDMATE_PARENT_HC_SESSION" 'session binding'
+printf 'dirty work\n' > "$NATIVE_HOME/dirty-work"
+cp "$NATIVE_HOME/.fm-secondmate-parent" "$TMP_ROOT/native-parent-before"
+if remote_env "$ROOT/bin/fm-remote-home-seed.sh" native remote-mac "$REMOTE_ROOT" "$NATIVE_HOME" \
+  --backend hc --hc-session lab --hc-core-id other --no-projects > "$TMP_ROOT/native-migrate" 2>&1; then
+  fail 'ordinary seed migrated the native core'
+fi
+cmp -s "$TMP_ROOT/native-parent-before" "$NATIVE_HOME/.fm-secondmate-parent" || fail 'refused migration changed binding'
+assert_equals 'dirty work' "$(cat "$NATIVE_HOME/dirty-work")" 'refused migration preserves dirty home'
+pass 'native remote seed binds delegate/session/core, refuses migration, and never auto-repairs readiness'
+
+# Deterministically change the binding while a second provision waits on its
+# real home lock. A pre-lock-only check would overwrite the newer binding.
+FM_HOME="$PARENT" FM_STATE_OVERRIDE="$PARENT/state" . "$ROOT/bin/fm-wake-lib.sh"
+HASH_TOOL=$(command -v shasum || command -v sha256sum)
+if [ "${HASH_TOOL##*/}" = shasum ]; then
+  native_hash=$(printf '%s' "$NATIVE_HOME" | "$HASH_TOOL" -a 256 | awk '{print $1}')
+else
+  native_hash=$(printf '%s' "$NATIVE_HOME" | "$HASH_TOOL" | awk '{print $1}')
+fi
+native_lock="$TMP_ROOT/.firstmate-provision-locks/.remote-home-provision-$native_hash.lock"
+fm_lock_try_acquire "$native_lock" || fail 'could not hold fixture provisioning lock'
+mkdir -p "$TMP_ROOT/native-race-bin"
+cat > "$TMP_ROOT/native-race-bin/${HASH_TOOL##*/}" <<'SH'
+#!/usr/bin/env bash
+touch "$FM_TEST_NATIVE_HASH_ENTERED"
+exec "$FM_TEST_REAL_HASH" "$@"
+SH
+chmod +x "$TMP_ROOT/native-race-bin/${HASH_TOOL##*/}"
+printf 'schema=fm-remote-home-provision.v1\nid_b64=%s\ncharter_b64=%s\nproject_count=0\nbackend=hc\nhc_session=lab\nhc_core_id=coreA\n' \
+  "$(printf native | base64 | tr -d '\n')" "$(printf 'Native concurrent fixture.' | base64 | tr -d '\n')" > "$TMP_ROOT/native-race.manifest"
+PATH="$TMP_ROOT/native-race-bin:$PATH" FM_HOME="$NATIVE_HOME" FM_ROOT_OVERRIDE="$REMOTE_ROOT" \
+  FM_TEST_REAL_HASH="$HASH_TOOL" FM_TEST_NATIVE_HASH_ENTERED="$TMP_ROOT/native-hash-entered" \
+  "$ROOT/bin/fm-remote-home-provision.sh" < "$TMP_ROOT/native-race.manifest" > "$TMP_ROOT/native-race.out" 2>&1 &
+PUBLISH_PID=$!
+for _ in $(seq 1 200); do [ ! -e "$TMP_ROOT/native-hash-entered" ] || break; sleep 0.02; done
+[ -e "$TMP_ROOT/native-hash-entered" ] || fail 'concurrent provision did not reach its home lock'
+kill -0 "$PUBLISH_PID" 2>/dev/null || fail 'concurrent provision did not wait for lock'
+sed 's/hc_core_id=coreA/hc_core_id=newer-core/' "$TMP_ROOT/native-parent-before" > "$NATIVE_HOME/.fm-secondmate-parent"
+fm_lock_release "$native_lock"
+race_rc=0
+wait "$PUBLISH_PID" || race_rc=$?
+PUBLISH_PID=
+[ "$race_rc" -ne 0 ] || fail 'waiting provision overwrote a newer native binding'
+assert_grep 'hc_core_id=newer-core' "$NATIVE_HOME/.fm-secondmate-parent" 'concurrent binding preserved'
+assert_equals 'dirty work' "$(cat "$NATIVE_HOME/dirty-work")" 'concurrent refusal preserves dirty home'
+pass 'native provisioning revalidates immutable identity after its serialization lock'
 
 echo "ALL TESTS PASSED"
