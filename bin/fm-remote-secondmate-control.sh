@@ -2,8 +2,9 @@
 # Host-local lifecycle control for the remote secondmate home selected by fm-on.
 #
 # Usage:
-#   fm-remote-secondmate-control.sh launch <id> <harness> <model|-> <effort|-> herdr [traceparent]
+#   fm-remote-secondmate-control.sh launch <id> <harness> <model|-> <effort|-> <herdr|hc> [traceparent]
 #   fm-remote-secondmate-control.sh relaunch <id> <harness> <model|default|-> <effort|default|->
+#   fm-remote-secondmate-control.sh interrupt|exit <id>
 #   fm-remote-secondmate-control.sh state <id>
 #   fm-remote-secondmate-control.sh route <id>
 #   fm-remote-secondmate-control.sh send <id> <message> [fire-and-forget]
@@ -15,10 +16,10 @@
 #   fm-remote-secondmate-control.sh update <id>
 #   fm-remote-secondmate-control.sh retire <id> [--force]
 #
-# Remote placement ends here, but the second-mate agent always runs on the
-# Herdr backend in the dedicated fm-remote session, so launch refuses any other
-# selection rather than reading this home's config/backend. The interactive
-# default session remains for the user's work.
+# Remote placement ends here. Legacy routes use Herdr's fm-remote session;
+# native routes use the immutable hc tuple in the seeded parent record.
+# The host-local delegate owns labels and parent-route state on every verb.
+# Native hc operations never start a missing core or inherit a Spark endpoint.
 # fm-spawn/fm-send/fm-teardown keep owning the local endpoint mechanics.
 # The home's own workers keep their ordinary backend selection.
 # bin/fm-remote-doctor.sh owns that host's readiness for Herdr.
@@ -77,6 +78,23 @@ if [ "${1:-}" = retire ] && [ ! -e "$TARGET_HOME" ] && [ ! -L "$TARGET_HOME" ]; 
   esac
 fi
 
+# Read the native placement before loading endpoint owners. FM_HOME below is
+# the label-owning local delegate; TARGET_HOME always remains the child's home.
+# shellcheck source=bin/fm-secondmate-parent-lib.sh
+. "$SCRIPT_DIR/fm-secondmate-parent-lib.sh"
+NATIVE_ROUTE=0
+if [ -e "$TARGET_HOME/.fm-secondmate-parent" ] || [ -L "$TARGET_HOME/.fm-secondmate-parent" ]; then
+  fm_secondmate_parent_record_parse "$TARGET_HOME/.fm-secondmate-parent" || die "invalid remote parent binding"
+  if [ "$FM_SECONDMATE_PARENT_BACKEND" = hc ]; then
+    [ "$FM_SECONDMATE_CONTROL_ROOT" = "$FM_ROOT" ] || die "native route belongs to another control root"
+    NATIVE_ROUTE=1
+    export FM_HC_EXPECT_CORE="$FM_SECONDMATE_PARENT_HC_CORE" HC_SESSION="$FM_SECONDMATE_PARENT_HC_SESSION"
+    export FM_HOME="$FM_ROOT" FM_STATE_OVERRIDE="$CONTROL_STATE" FM_DATA_OVERRIDE="$CONTROL_DATA"
+    export FM_CONFIG_OVERRIDE="$TARGET_HOME/config"
+    unset HC_SOCKET HC_TERMINAL_ID HC_TERMINAL_SOCKET HC_SCOPE FM_HC_PARENT_TARGET FM_HC_PARENT_CORE_ID FM_SUPERVISOR_BACKEND FM_SUPERVISOR_TARGET
+  fi
+fi
+
 # shellcheck source=bin/fm-backend.sh
 . "$SCRIPT_DIR/fm-backend.sh"
 # shellcheck source=bin/fm-ff-lib.sh
@@ -108,7 +126,20 @@ remote_endpoint_load() {
   fi
   REMOTE_ENDPOINT_BACKEND=$FM_BACKEND_VALIDATED_BACKEND
   REMOTE_ENDPOINT_TARGET=$FM_BACKEND_VALIDATED_TARGET
-  if [ "$REMOTE_ENDPOINT_BACKEND" != herdr ]; then
+  if [ "$REMOTE_ENDPOINT_BACKEND" = hc ] && [ "$NATIVE_ROUTE" = 1 ]; then
+    fm_backend_source hc || return 1
+    if [ "$(fm_meta_get "$REMOTE_ENDPOINT_META" kind)" != secondmate ] \
+      || [ "$(fm_meta_get "$REMOTE_ENDPOINT_META" home)" != "$TARGET_HOME" ] \
+      || [ "$(fm_meta_get "$REMOTE_ENDPOINT_META" harness)" != codex ] \
+      || [ "$(fm_meta_get "$REMOTE_ENDPOINT_META" hc_session)" != "$HC_SESSION" ] \
+      || [ "$(fm_meta_get "$REMOTE_ENDPOINT_META" hc_core_id)" != "$FM_HC_EXPECT_CORE" ] \
+      || ! fm_backend_hc_record_matches_core "$REMOTE_ENDPOINT_META"; then
+      REMOTE_ENDPOINT_ERROR="native core identity is unavailable or changed; preserving route"
+      return 1
+    fi
+    return 0
+  fi
+  if [ "$REMOTE_ENDPOINT_BACKEND" != herdr ] || [ "$NATIVE_ROUTE" = 1 ]; then
     REMOTE_ENDPOINT_ERROR="remote secondmate $id endpoint is recorded on backend '$REMOTE_ENDPOINT_BACKEND', expected 'herdr'; refusing access until it is explicitly migrated"
     return 1
   fi
@@ -131,15 +162,28 @@ remote_endpoint_require() {
 }
 
 state_value() { # <id>; prints recovery-grade state
-  local id=$1 meta
+  local id=$1 meta state
   meta=$(meta_path "$id")
+  if [ "$NATIVE_ROUTE" = 1 ]; then
+    fm_backend_source hc || return 1
+    if ! fm_backend_hc_core_id "$HC_SESSION" >/dev/null; then
+      printf 'unverified\n'
+      return 0
+    fi
+  fi
   [ -f "$meta" ] && [ ! -L "$meta" ] || { printf 'missing\n'; return 0; }
   if ! remote_endpoint_load "$id"; then
     printf 'error: %s\n' "$REMOTE_ENDPOINT_ERROR" >&2
     printf 'unverified\n'
     return 0
   fi
-  fm_backend_agent_state "$REMOTE_ENDPOINT_BACKEND" "$REMOTE_ENDPOINT_TARGET" 2>/dev/null || printf 'unreadable\n'
+  state=$(fm_backend_agent_state "$REMOTE_ENDPOINT_BACKEND" "$REMOTE_ENDPOINT_TARGET" "fm-$id" 2>/dev/null) || state=unreadable
+  if [ "$NATIVE_ROUTE:$state" = 1:alive ]; then
+    # shellcheck source=bin/fm-hc-secondmate-lib.sh
+    . "$SCRIPT_DIR/fm-hc-secondmate-lib.sh"
+    FM_HC_SECONDMATE_READY_POLLS=1 fm_hc_secondmate_wait_ready "$TARGET_HOME" "$REMOTE_ENDPOINT_TARGET" "fm-$id" >/dev/null 2>&1 || state=unverified
+  fi
+  printf '%s\n' "$state"
 }
 
 print_route() { # <id>
@@ -152,7 +196,11 @@ print_route() { # <id>
   printf 'schema=fm-remote-secondmate-control.v1\n'
   printf 'backend=%s\n' "$REMOTE_ENDPOINT_BACKEND"
   printf 'target=%s\n' "$REMOTE_ENDPOINT_TARGET"
-  printf 'herdr_session=%s\n' "$REMOTE_HERDR_SESSION"
+  if [ "$REMOTE_ENDPOINT_BACKEND" = hc ]; then
+    printf 'hc_session=%s\nhc_core_id=%s\nhc_terminal=%s\n' "$HC_SESSION" "$FM_HC_EXPECT_CORE" "${REMOTE_ENDPOINT_TARGET#*:}"
+  else
+    printf 'herdr_session=%s\n' "$REMOTE_HERDR_SESSION"
+  fi
   printf 'harness=%s\n' "$harness"
   printf 'model=%s\n' "$model"
   printf 'effort=%s\n' "$effort"
@@ -184,21 +232,35 @@ cmd_launch() {
   if [ "$effort" = ultra ]; then
     "$SCRIPT_DIR/fm-harness.sh" validate-native-effort "$harness" "$model" "$effort" || return 1
   fi
-  # Herdr is required on this host, not merely preferred: its server belongs to
-  # the GUI login session, so the endpoint survives every SSH disconnection that
-  # a remote route depends on. bin/fm-remote-doctor.sh is the readiness owner.
-  case "$selected_backend" in herdr) ;; *) die "a remote secondmate runs only on the herdr backend, not '$selected_backend'" ;; esac
+  # The seeded placement is authoritative; destination-local ownership keeps
+  # either backend independent of the SSH transport's process lifetime.
+  case "$selected_backend:$NATIVE_ROUTE" in
+    herdr:0) ;;
+    hc:1) [ "$harness" = codex ] || die "native remote hc currently requires managed Codex" ;;
+    *) die "requested backend disagrees with the seeded remote route" ;;
+  esac
+  [ ! -L "$CONTROL_STATE" ] && [ ! -L "$CONTROL_DATA" ] || die "unsafe parent-route directories"
   mkdir -p "$CONTROL_STATE" "$CONTROL_DATA"
   meta=$(meta_path "$id")
   if [ -f "$meta" ]; then
     remote_endpoint_require "$id"
-    current=$(fm_backend_agent_state "$REMOTE_ENDPOINT_BACKEND" "$REMOTE_ENDPOINT_TARGET" 2>/dev/null || printf 'unreadable\n')
+    current=$(fm_backend_agent_state "$REMOTE_ENDPOINT_BACKEND" "$REMOTE_ENDPOINT_TARGET" "fm-$id" 2>/dev/null || printf 'unreadable\n')
     case "$current" in
       alive)
+        if [ "$NATIVE_ROUTE" = 1 ]; then
+          # shellcheck source=bin/fm-hc-secondmate-lib.sh
+          . "$SCRIPT_DIR/fm-hc-secondmate-lib.sh"
+          FM_HC_SECONDMATE_READY_POLLS=1 fm_hc_secondmate_wait_ready "$TARGET_HOME" "$REMOTE_ENDPOINT_TARGET" "fm-$id" || return 1
+        fi
         print_route "$id"
         return 0
         ;;
       dead)
+        if [ "$NATIVE_ROUTE" = 1 ]; then
+          # shellcheck source=bin/fm-hc-secondmate-lib.sh
+          . "$SCRIPT_DIR/fm-hc-secondmate-lib.sh"
+          fm_hc_secondmate_control_safe "$TARGET_HOME" "$REMOTE_ENDPOINT_TARGET" || return 1
+        fi
         fm_backend_kill "$REMOTE_ENDPOINT_BACKEND" "$REMOTE_ENDPOINT_TARGET" 2>/dev/null \
           || die "could not remove the confirmed agent-less endpoint"
         ;;
@@ -214,7 +276,7 @@ cmd_launch() {
   [ "$model" = - ] || ARGS+=(--model "$model")
   [ "$effort" = - ] || ARGS+=(--effort "$effort")
   [ -z "$traceparent" ] || ARGS+=(--traceparent "$traceparent")
-  if ! out=$(HERDR_SESSION="$REMOTE_HERDR_SESSION" FM_HOME="$FM_ROOT" FM_ROOT_OVERRIDE="$FM_ROOT" \
+  if ! out=$(FM_HC_REMOTE_SUPERVISOR="$NATIVE_ROUTE" HERDR_SESSION="$REMOTE_HERDR_SESSION" FM_HOME="$FM_ROOT" FM_ROOT_OVERRIDE="$FM_ROOT" \
     FM_STATE_OVERRIDE="$CONTROL_STATE" FM_DATA_OVERRIDE="$CONTROL_DATA" \
     FM_CONFIG_OVERRIDE="$TARGET_HOME/config" FM_SKIP_SECONDMATE_INHERIT=1 \
     FM_SKIP_SECONDMATE_SYNC=1 \
@@ -224,7 +286,7 @@ cmd_launch() {
   fi
   [ -f "$meta" ] || die "remote launch returned without endpoint metadata"
   herdr_session=$(fm_meta_get "$meta" herdr_session)
-  [ "$herdr_session" = "$REMOTE_HERDR_SESSION" ] \
+  [ "$selected_backend" = hc ] || [ "$herdr_session" = "$REMOTE_HERDR_SESSION" ] \
     || die "remote launch recorded Herdr session '${herdr_session:-missing}', expected '$REMOTE_HERDR_SESSION'"
   print_route "$id"
 }
@@ -258,6 +320,7 @@ cmd_relaunch() {
     "$SCRIPT_DIR/fm-harness.sh" validate-native-effort "$harness" "$model" "$effort" || return 1
   fi
   remote_endpoint_require "$id"
+  [ "$NATIVE_ROUTE" != 1 ] || [ "$harness" = codex ] || die "native remote hc currently requires managed Codex"
   [ "$model" != - ] || model=default
   [ "$effort" != - ] || effort=default
   control_args=("$id" relaunch --harness "$harness" --model "$model" --effort "$effort")
@@ -265,7 +328,7 @@ cmd_relaunch() {
   # the dedicated fm-remote session, and the parent already owns both convergence
   # legs, so the host-local spawn must not re-sync or re-inherit against this
   # host's own Firstmate copy.
-  HERDR_SESSION="$REMOTE_HERDR_SESSION" FM_HOME="$FM_ROOT" FM_ROOT_OVERRIDE="$FM_ROOT" \
+  FM_HC_REMOTE_SUPERVISOR="$NATIVE_ROUTE" HERDR_SESSION="$REMOTE_HERDR_SESSION" FM_HOME="$FM_ROOT" FM_ROOT_OVERRIDE="$FM_ROOT" \
     FM_STATE_OVERRIDE="$CONTROL_STATE" FM_DATA_OVERRIDE="$CONTROL_DATA" \
     FM_CONFIG_OVERRIDE="$TARGET_HOME/config" FM_SKIP_SECONDMATE_INHERIT=1 \
     FM_SKIP_SECONDMATE_SYNC=1 \
@@ -341,8 +404,22 @@ cmd_key() {
   validate_id "$id"
   validate_home "$id"
   remote_endpoint_require "$id"
-  FM_HOME="$TARGET_HOME" FM_ROOT_OVERRIDE="$FM_ROOT" FM_STATE_OVERRIDE="$TARGET_HOME/state" \
-    "$SCRIPT_DIR/fm-send.sh" "$REMOTE_ENDPOINT_TARGET" --key "$key"
+  if [ "$NATIVE_ROUTE" = 1 ]; then
+    "$SCRIPT_DIR/fm-send.sh" "$id" --key "$key"
+  else
+    FM_HOME="$TARGET_HOME" FM_ROOT_OVERRIDE="$FM_ROOT" FM_STATE_OVERRIDE="$TARGET_HOME/state" \
+      "$SCRIPT_DIR/fm-send.sh" "$REMOTE_ENDPOINT_TARGET" --key "$key"
+  fi
+}
+
+cmd_lifecycle() { # <interrupt|exit> <id>
+  local action=$1 id=$2
+  validate_id "$id"
+  validate_home "$id"
+  remote_endpoint_require "$id"
+  FM_HOME="$FM_ROOT" FM_ROOT_OVERRIDE="$FM_ROOT" \
+    FM_STATE_OVERRIDE="$CONTROL_STATE" FM_DATA_OVERRIDE="$CONTROL_DATA" \
+    FM_CONFIG_OVERRIDE="$TARGET_HOME/config" "$SCRIPT_DIR/fm-control.sh" "$id" "$action"
 }
 
 cmd_capture() {
@@ -458,6 +535,7 @@ cmd_retire() {
 case "${1:-}" in
   launch) shift; [ "$#" -ge 5 ] && [ "$#" -le 6 ] || usage; cmd_launch "$@" ;;
   relaunch) shift; [ "$#" -eq 4 ] || usage; cmd_relaunch "$@" ;;
+  interrupt|exit) action=$1; shift; [ "$#" -eq 1 ] || usage; cmd_lifecycle "$action" "$1" ;;
   state) shift; [ "$#" -eq 1 ] || usage; validate_id "$1"; validate_home "$1"; state_value "$1" ;;
   route) shift; [ "$#" -eq 1 ] || usage; cmd_route "$1" ;;
   send) shift; [ "$#" -ge 2 ] && [ "$#" -le 3 ] || usage; cmd_send "$@" ;;

@@ -6,6 +6,8 @@
 #   (home: ...; scope: ...; projects: ...; added YYYY-MM-DD)
 # A remote record adds its host placement before the existing fields:
 #   (host: ...; root: ...; home: ...; scope: ...; projects: ...; added YYYY-MM-DD)
+# Native remote records insert `backend: hc; hc-session: <atom>; hc-core: <atom>;`
+# between home and scope. All three are required; absent retains legacy Herdr.
 # Summary text and scope text are natural language and may contain parentheses
 # and semicolons, so field boundaries are anchored to the suffix markers rather
 # than to the first incidental punctuation.
@@ -19,6 +21,9 @@ SECONDMATE_REGISTRY_SCOPE=
 SECONDMATE_REGISTRY_PROJECTS=
 SECONDMATE_REGISTRY_ADDED=
 SECONDMATE_REGISTRY_REMOTE=0
+SECONDMATE_REGISTRY_BACKEND=herdr
+SECONDMATE_REGISTRY_HC_SESSION=
+SECONDMATE_REGISTRY_HC_CORE=
 SECONDMATE_REGISTRY_LINE=
 SECONDMATE_REGISTRY_MATCH_HOST=
 SECONDMATE_REGISTRY_MATCH_ROOT=
@@ -35,6 +40,16 @@ secondmate_registry_parse_line() {
   local line=$1
   local local_re='^- ([A-Za-z0-9._-]+) - (.+) \(home:[[:space:]]*([^;)]*);[[:space:]]*scope:[[:space:]]*(.*);[[:space:]]*projects:[[:space:]]*([^;)]*);[[:space:]]*added[[:space:]]+([0-9]{4}-[0-9]{2}-[0-9]{2})\)[[:space:]]*$'
   local remote_re='^- ([A-Za-z0-9._-]+) - (.+) \(host:[[:space:]]*([^;)]*);[[:space:]]*root:[[:space:]]*([^;)]*);[[:space:]]*home:[[:space:]]*([^;)]*);[[:space:]]*scope:[[:space:]]*(.*);[[:space:]]*projects:[[:space:]]*([^;)]*);[[:space:]]*added[[:space:]]+([0-9]{4}-[0-9]{2}-[0-9]{2})\)[[:space:]]*$'
+  local native_re='^(.+ \(host: [^;)]+; root: [^;)]+; home: [^;)]+); backend: hc; hc-session: ([A-Za-z0-9_][A-Za-z0-9._-]*); hc-core: ([A-Za-z0-9_-]+); (scope: .*)$'
+  SECONDMATE_REGISTRY_BACKEND=herdr
+  SECONDMATE_REGISTRY_HC_SESSION=
+  SECONDMATE_REGISTRY_HC_CORE=
+  if [[ "$line" =~ $native_re ]]; then
+    SECONDMATE_REGISTRY_BACKEND=hc
+    SECONDMATE_REGISTRY_HC_SESSION=${BASH_REMATCH[2]}
+    SECONDMATE_REGISTRY_HC_CORE=${BASH_REMATCH[3]}
+    line="${BASH_REMATCH[1]}; ${BASH_REMATCH[4]}"
+  fi
   SECONDMATE_REGISTRY_ID=
   SECONDMATE_REGISTRY_SUMMARY=
   SECONDMATE_REGISTRY_HOST=
@@ -66,6 +81,7 @@ secondmate_registry_parse_line() {
   else
     return 1
   fi
+  [ "$SECONDMATE_REGISTRY_BACKEND" != hc ] || [ "$SECONDMATE_REGISTRY_REMOTE" = 1 ] || return 1
   [ -n "$SECONDMATE_REGISTRY_HOME" ] || return 1
   [ -n "$SECONDMATE_REGISTRY_SCOPE" ] || return 1
   if [ "$SECONDMATE_REGISTRY_REMOTE" -eq 1 ]; then
@@ -98,6 +114,9 @@ secondmate_registry_field() {
     home) printf '%s\n' "$SECONDMATE_REGISTRY_HOME" ;;
     scope) printf '%s\n' "$SECONDMATE_REGISTRY_SCOPE" ;;
     projects) printf '%s\n' "$SECONDMATE_REGISTRY_PROJECTS" ;;
+    backend) printf '%s\n' "$SECONDMATE_REGISTRY_BACKEND" ;;
+    hc_session) printf '%s\n' "$SECONDMATE_REGISTRY_HC_SESSION" ;;
+    hc_core_id) printf '%s\n' "$SECONDMATE_REGISTRY_HC_CORE" ;;
     remote) printf '%s\n' "$SECONDMATE_REGISTRY_REMOTE" ;;
     *) return 1 ;;
   esac
@@ -308,4 +327,52 @@ secondmate_registry_validate_bindings() {
     fi
   fi
   return 0
+}
+
+# Remote receipt fields are unique, destination-confirmed identities, not hints.
+# Native receipts must agree with the registry's permanent core pin; a changed
+# terminal on that same core is valid after an explicit host-local relaunch.
+secondmate_remote_receipt_value() { # <receipt> <key>
+  printf '%s\n' "$1" | awk -v key="$2" '
+    index($0, key "=")==1 { n++; value=substr($0,length(key)+2) }
+    END { if(n!=1) exit 1; print value }'
+}
+
+secondmate_remote_receipt_validate() { # <registry> <id> <receipt>
+  local reg=$1 id=$2 receipt=$3 session core terminal
+  secondmate_registry_line_for_id "$reg" "$id" || return 1
+  [ "$SECONDMATE_REGISTRY_REMOTE" = 1 ] || return 1
+  [ "$(secondmate_remote_receipt_value "$receipt" schema)" = fm-remote-secondmate-control.v1 ] || return 1
+  SECONDMATE_RECEIPT_BACKEND=$(secondmate_remote_receipt_value "$receipt" backend) || return 1
+  SECONDMATE_RECEIPT_TARGET=$(secondmate_remote_receipt_value "$receipt" target) || return 1
+  [ "$SECONDMATE_RECEIPT_BACKEND" = "$SECONDMATE_REGISTRY_BACKEND" ] || return 1
+  if [ "$SECONDMATE_RECEIPT_BACKEND" = hc ]; then
+    session=$(secondmate_remote_receipt_value "$receipt" hc_session) || return 1
+    core=$(secondmate_remote_receipt_value "$receipt" hc_core_id) || return 1
+    terminal=$(secondmate_remote_receipt_value "$receipt" hc_terminal) || return 1
+    [ "$session" = "$SECONDMATE_REGISTRY_HC_SESSION" ] && [ "$core" = "$SECONDMATE_REGISTRY_HC_CORE" ] || return 1
+    [[ "$terminal" =~ ^t[0-9a-z]+$ ]] && [ "$SECONDMATE_RECEIPT_TARGET" = "$session:$terminal" ] || return 1
+  else
+    [ "$(secondmate_remote_receipt_value "$receipt" herdr_session)" = fm-remote ] || return 1
+    case "$SECONDMATE_RECEIPT_TARGET" in fm-remote:?*) ;; *) return 1 ;; esac
+  fi
+}
+
+secondmate_remote_meta_matches() { # <registry> <id> <parent-meta>
+  local reg=$1 id=$2 meta=$3 record
+  secondmate_registry_line_for_id "$reg" "$id" || return 1
+  [ "$SECONDMATE_REGISTRY_REMOTE" = 1 ] && [ -f "$meta" ] && [ ! -L "$meta" ] || return 1
+  record=$(cat "$meta") || return 1
+  [ "$(secondmate_remote_receipt_value "$record" remote_host)" = "$SECONDMATE_REGISTRY_HOST" ] &&
+    [ "$(secondmate_remote_receipt_value "$record" remote_root)" = "$SECONDMATE_REGISTRY_ROOT" ] &&
+    [ "$(secondmate_remote_receipt_value "$record" home)" = "$SECONDMATE_REGISTRY_HOME" ] &&
+    [ "$(secondmate_remote_receipt_value "$record" remote_backend)" = "$SECONDMATE_REGISTRY_BACKEND" ] || return 1
+  if [ "$SECONDMATE_REGISTRY_BACKEND" = hc ]; then
+    [ "$(secondmate_remote_receipt_value "$record" remote_hc_session)" = "$SECONDMATE_REGISTRY_HC_SESSION" ] &&
+      [ "$(secondmate_remote_receipt_value "$record" remote_hc_core_id)" = "$SECONDMATE_REGISTRY_HC_CORE" ] || return 1
+    local terminal
+    terminal=$(secondmate_remote_receipt_value "$record" remote_hc_terminal) || return 1
+    [[ "$terminal" =~ ^t[0-9a-z]+$ ]] &&
+      [ "$(secondmate_remote_receipt_value "$record" remote_target)" = "$SECONDMATE_REGISTRY_HC_SESSION:$terminal" ] || return 1
+  fi
 }

@@ -264,4 +264,76 @@ fm_backend_kill hc "$T" || fail "kill failed"
 assert_equals "$(fm_backend_agent_state hc "$T")" missing "a closed terminal is missing"
 fm_backend_kill hc "$T" || fail "closing an already-closed terminal must be a silent success"
 pass "hc smoke: kill closes and removes the terminal"
+# Native remote homes take this same adapter through an existing socket only.
+# Exercise the wire path against the isolated real core, including a nested
+# child and independent lifetime. The original CLI coverage above stays intact.
+export FM_HC_EXPECT_CORE=$PARENT_CORE
+SES=$(fm_backend_hc_container_ensure) || fail 'pinned existing core readiness'
+ADDR=$(FM_HC_REMOTE_SUPERVISOR=1 fm_backend_hc_create_task "$SES" fm-remote-mate "$WORK_DIR" secondmate) || fail 'pinned supervisor create'
+T="$SES:$ADDR"
+fm_backend_hc_get "$T" | jq -e '.parent == null and .die_with_parent == false' >/dev/null || fail 'remote supervisor must be standalone'
+fm_backend_hc_send_text_line "$T" 'echo Pinned-Socket-42' fm-remote-mate || fail 'pinned send'
+pinned_capture() { fm_backend_capture hc "$T" 50 fm-remote-mate | grep -qx Pinned-Socket-42; }
+wait_for 10 pinned_capture || fail 'pinned read'
+# The real remote control owner must use the same host-local home labels for
+# route, capture and durable send as the creating delegate. This is a protocol
+# and inbox smoke with a shell, not a claim about a credentialed Codex turn.
+REMOTE_HOME="$TMP_ROOT/remote-home"
+mkdir -p "$REMOTE_HOME/state/parent-route" "$REMOTE_HOME/bin" "$REMOTE_HOME/projects/scratch"
+printf 'dirty remote work\n' > "$REMOTE_HOME/projects/scratch/uncommitted"
+touch "$REMOTE_HOME/AGENTS.md"
+printf 'remote-mate\n' > "$REMOTE_HOME/.fm-secondmate-home"
+cat > "$REMOTE_HOME/.fm-secondmate-parent" <<EOF
+schema=fm-secondmate-parent.v1
+route=remote
+parent_host=spark
+control_root=$FM_HOME_DIR
+backend=hc
+hc_session=$SES
+hc_core_id=$PARENT_CORE
+EOF
+cat > "$REMOTE_HOME/state/parent-route/remote-mate.meta" <<EOF
+window=$T
+worktree=$REMOTE_HOME
+project=$FM_HOME_DIR
+endpoint_task_id=remote-mate
+backend=hc
+hc_session=$SES
+hc_terminal=$ADDR
+hc_core_id=$PARENT_CORE
+kind=secondmate
+harness=codex
+home=$REMOTE_HOME
+EOF
+remote_control() { FM_HOME="$REMOTE_HOME" FM_ROOT_OVERRIDE="$FM_HOME_DIR" bash "$ROOT/bin/fm-remote-secondmate-control.sh" "$@"; }
+receipt=$(remote_control route remote-mate) || fail 'native remote receipt'
+assert_contains "$receipt" "target=$T" 'receipt target'
+assert_contains "$receipt" "hc_core_id=$PARENT_CORE" 'receipt permanent core'
+remote_control capture remote-mate 30 | grep -qx Pinned-Socket-42 || fail 'native remote capture owner'
+remote_control send remote-mate 'request [corr=0123456789abcdef]: isolated durable steer' >/dev/null 2>&1 || fail 'native durable send'
+remote_control send remote-mate 'request [corr=0123456789abcdef]: isolated durable steer' >/dev/null 2>&1 || fail 'native exact resend'
+assert_equals 1 "$(find "$REMOTE_HOME/state/parent-route/remote-mate.inbox" -maxdepth 1 -name '*.msg' | wc -l | tr -d ' ')" 'remote same-body resend is idempotent'
+cp "$REMOTE_HOME/.fm-secondmate-parent" "$TMP_ROOT/parent-before"
+sed 's/^hc_core_id=.*/hc_core_id=wrong-core/' "$TMP_ROOT/parent-before" > "$REMOTE_HOME/.fm-secondmate-parent"
+if remote_control capture remote-mate 10 >/dev/null 2>&1; then fail 'remote owner accepted changed core'; fi
+cp "$TMP_ROOT/parent-before" "$REMOTE_HOME/.fm-secondmate-parent"
+assert_equals 'dirty remote work' "$(cat "$REMOTE_HOME/projects/scratch/uncommitted")" 'remote refusals preserve work'
+pass 'native remote control: exact receipt, consistent capture owner, durable deduplicated inbox and wrong-core preservation'
+
+# Explicit task-labelled parents need the native home binding; plain shell
+# primary for this transport-only child proof retains the same permanent core.
+PINNED_PARENT=$(fm_backend_hc_cli "$SES" run --bg --json --name pinned-primary --cwd "$WORK_DIR" --no-parent --outlive-parent --no-notify | jq -er .address) || fail 'pinned shell parent'
+CHILD=$(FM_HC_PARENT_TARGET="$SES:$PINNED_PARENT" FM_HC_PARENT_CORE_ID="$PARENT_CORE" \
+  fm_backend_hc_create_task "$SES" fm-pinned-child "$WORK_DIR") || fail 'pinned child create'
+parent_is "$CHILD" "$PINNED_PARENT" || fail 'pinned parent parameters'
+if FM_HC_EXPECT_CORE=wrong-core fm_backend_hc_kill "$T" '' fm-remote-mate; then fail 'wrong core accepted'; fi
+if FM_HOME="$TMP_ROOT/other-home" fm_backend_hc_kill "$T" '' fm-remote-mate; then fail 'wrong home accepted'; fi
+fm_backend_target_exists hc "$T" fm-remote-mate || fail 'refusals damaged endpoint'
+fm_backend_kill hc "$T" || fail 'pinned close'
+fm_backend_hc_cli "$SES" kill --json "$PINNED_PARENT" >/dev/null || fail 'pinned parent close'
+fm_backend_hc_cli "$SES" rm --json "$PINNED_PARENT" >/dev/null || fail 'pinned parent remove'
+fm_backend_target_exists hc "$SES:$CHILD" fm-pinned-child || fail 'pinned close harmed independent child'
+fm_backend_kill hc "$SES:$CHILD" || fail 'pinned child close'
+unset FM_HC_EXPECT_CORE
+pass 'native existing-socket path: real-core create, parent, send/read, wrong-core/home refusal, close and independent child'
 echo FM_TEST_COMPLETE

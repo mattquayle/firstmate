@@ -82,4 +82,25 @@ rm "$TMP_ROOT/mate/state/.lock"
 ln -s "$TMP_ROOT/parent/state/.lock" "$TMP_ROOT/mate/state/.lock"
 if fm_hc_secondmate_require_unlocked "$TMP_ROOT/mate" >/dev/null 2>&1; then fail 'symlinked lock accepted'; fi
 pass 'separate homes keep independent locks; stale and malformed endpoint incarnations fail closed'
+# A remote binding names the host-local delegate, never a remote host PID.
+cat > "$TMP_ROOT/mate/.fm-secondmate-parent" <<EOF
+schema=fm-secondmate-parent.v1
+route=remote
+parent_host=spark
+control_root=$TMP_ROOT/parent
+backend=hc
+hc_session=lab
+hc_core_id=coreA
+EOF
+FM_STATE_OVERRIDE="$TMP_ROOT/mate/state/parent-route" FM_HC_EXPECT_CORE=coreA HC_SESSION=lab \
+  fm_hc_secondmate_parent_matches "$TMP_ROOT/mate" "$TMP_ROOT/parent" || fail 'valid remote control delegate refused'
+for variant in root state core session; do
+  p="$TMP_ROOT/parent" st="$TMP_ROOT/mate/state/parent-route" c=coreA ses=lab
+  case "$variant" in root) p="$TMP_ROOT" ;; state) st="$TMP_ROOT/parent/state" ;; core) c=other ;; session) ses=other ;; esac
+  if FM_STATE_OVERRIDE="$st" FM_HC_EXPECT_CORE="$c" HC_SESSION="$ses" \
+    fm_hc_secondmate_parent_matches "$TMP_ROOT/mate" "$p" >/dev/null 2>&1; then fail "foreign remote $variant accepted"; fi
+done
+printf 'hc_core_id=coreA\n' >> "$TMP_ROOT/mate/.fm-secondmate-parent"
+if fm_secondmate_parent_record_parse "$TMP_ROOT/mate/.fm-secondmate-parent"; then fail 'duplicate native binding accepted'; fi
+pass 'remote delegate requires exact control root, home state, session and core without weakening PID ancestry'
 echo FM_TEST_COMPLETE

@@ -761,6 +761,7 @@ window=remote:rsm1
 kind=secondmate
 harness=claude
 remote_host=lab-host
+remote_root=/remote/root
 remote_backend=herdr
 remote_herdr_session=fm-remote
 remote_target=fm-remote:w1:p1
@@ -863,5 +864,20 @@ test_relaunch_waits_for_other_mates_relaunch_lock
 test_sweep_refuses_relaunch_on_ledger_errors
 test_remote_poll_probe_maps_states
 test_remote_poll_probe_unreachable_preserves_route
+w=$(make_remote_probe_world native-probe)
+sed 's/; scope:/; backend: hc; hc-session: lab; hc-core: coreA; scope:/' "$w/home/data/secondmates.md" > "$w/reg"
+mv "$w/reg" "$w/home/data/secondmates.md"
+sed 's/remote_backend=herdr/remote_backend=hc/; s/remote_target=.*/remote_target=lab:t1/' "$w/home/state/rsm1.meta" > "$w/meta"
+printf 'remote_hc_session=lab\nremote_hc_core_id=coreA\nremote_hc_terminal=t1\n' >> "$w/meta"
+mv "$w/meta" "$w/home/state/rsm1.meta"
+out=$(probe_remote "$w" poll FM_FAKE_REMOTE_REPLY=missing)
+assert_contains "$out" 'relaunchable|missing|' 'confirmed native missing state may recover on its host'
+sed 's/remote_hc_core_id=coreA/remote_hc_core_id=other/' "$w/home/state/rsm1.meta" > "$w/meta"
+mv "$w/meta" "$w/home/state/rsm1.meta"
+count=$(wc -l < "$w/ssh.log")
+out=$(probe_remote "$w" poll FM_FAKE_REMOTE_REPLY=missing)
+assert_contains "$out" 'remote route metadata disagrees' 'changed core preserves route'
+assert_equals "$count" "$(wc -l < "$w/ssh.log")" 'mismatched native route makes no remote call'
+pass 'native recovery preserves mismatched core identity before contacting any host' 
 
 echo "# all fm-secondmate-liveness tests passed"

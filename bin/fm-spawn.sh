@@ -1289,7 +1289,14 @@ spawn_remote_secondmate() {
     echo "error: secondmate registry could not be locked for remote spawn" >&2
     return 1
   fi
-  remote=$(secondmate_registry_field "$DATA/secondmates.md" "$id" remote 2>/dev/null || true)
+  if ! remote=$(secondmate_registry_field "$DATA/secondmates.md" "$id" remote 2>/dev/null); then
+    if [ -L "$DATA/secondmates.md" ] || { [ -f "$DATA/secondmates.md" ] && grep -Eq "^- $id( |$)" "$DATA/secondmates.md"; }; then
+      fm_lock_release "$registry_lock" || true
+      fm_lock_release "$SPAWN_TASK_LOCK" || true
+      echo "error: ambiguous or malformed registered secondmate $id; refusing local fallback" >&2
+      return 1
+    fi
+  fi
   if [ "$remote" != 1 ]; then
     fm_lock_release "$registry_lock" || true
     fm_lock_release "$SPAWN_TASK_LOCK" || true
@@ -1344,19 +1351,19 @@ spawn_remote_secondmate() {
       [ -n "$effort" ] || effort=-
     fi
   fi
-  # A remote second mate always runs on Herdr: its server belongs to the host's
-  # own GUI login session, so the endpoint outlives every SSH connection that
-  # supervises it. bin/fm-remote-doctor.sh gates that host on the same
-  # requirement, and the remote home's config/backend never overrides it.
-  case "${BACKEND_ARG:--}" in
-  - | herdr) backend=herdr ;;
-  *)
+  backend=$(secondmate_registry_field "$DATA/secondmates.md" "$id" backend)
+  if [ -n "$BACKEND_ARG" ] && [ "$BACKEND_ARG" != "$backend" ]; then
     fm_lock_release "$registry_lock" || true
     fm_lock_release "$SPAWN_TASK_LOCK" || true
-    echo "error: a remote secondmate runs only on the herdr backend, not '$BACKEND_ARG'" >&2
+    echo "error: requested remote backend disagrees with the registered route ($backend)" >&2
     return 1
-    ;;
-  esac
+  fi
+  if [ "$backend" = hc ] && [ "$harness" != codex ]; then
+    fm_lock_release "$registry_lock" || true
+    fm_lock_release "$SPAWN_TASK_LOCK" || true
+    echo "error: native remote hc currently requires managed Codex" >&2
+    return 1
+  fi
   case "$effort" in
   - | low | medium | high | xhigh | max | ultra) ;;
   *)
@@ -1377,7 +1384,8 @@ spawn_remote_secondmate() {
       [ "$(fm_meta_get "$meta" kind)" != secondmate ] ||
       [ "$(fm_meta_get "$meta" remote_host)" != "$host" ] ||
       [ "$(fm_meta_get "$meta" remote_root)" != "$root" ] ||
-      [ "$(fm_meta_get "$meta" home)" != "$home" ]; then
+      [ "$(fm_meta_get "$meta" home)" != "$home" ] ||
+      ! secondmate_remote_meta_matches "$DATA/secondmates.md" "$id" "$meta"; then
       fm_lock_release "$registry_lock" || true
       fm_lock_release "$SPAWN_TASK_LOCK" || true
       echo "error: existing metadata for $id does not identify this remote secondmate route" >&2
@@ -1478,29 +1486,23 @@ spawn_remote_secondmate() {
     fi
     return "$rc"
   fi
-  remote_backend=$(printf '%s\n' "$out" | sed -n 's/^backend=//p' | tail -1)
-  remote_target=$(printf '%s\n' "$out" | sed -n 's/^target=//p' | tail -1)
-  remote_harness=$(printf '%s\n' "$out" | sed -n 's/^harness=//p' | tail -1)
-  remote_herdr_session=$(printf '%s\n' "$out" | sed -n 's/^herdr_session=//p' | tail -1)
-  if [ "$remote_backend" != herdr ]; then
+  if ! secondmate_remote_receipt_validate "$DATA/secondmates.md" "$id" "$out"; then
     fm_lock_release "$remote_lock" || true
     fm_lock_release "$registry_lock" || true
     fm_lock_release "$SPAWN_TASK_LOCK" || true
-    echo "error: remote launch returned backend '${remote_backend:-missing}', expected herdr; preserving the remote route for reconciliation" >&2
+    echo "error: remote launch returned an invalid or mismatched endpoint/core receipt; preserving route for reconciliation" >&2
     return 1
   fi
-  [ -n "$remote_target" ] && [ "$remote_harness" = "$harness" ] || {
+  remote_backend=$SECONDMATE_RECEIPT_BACKEND
+  remote_target=$SECONDMATE_RECEIPT_TARGET
+  remote_herdr_session=
+  [ "$backend" != herdr ] || remote_herdr_session=fm-remote
+  remote_harness=$(secondmate_remote_receipt_value "$out" harness) || remote_harness=
+  if [ "$remote_harness" != "$harness" ]; then
     fm_lock_release "$remote_lock" || true
     fm_lock_release "$registry_lock" || true
     fm_lock_release "$SPAWN_TASK_LOCK" || true
-    echo "error: remote launch returned malformed route metadata; preserving the remote route for reconciliation" >&2
-    return 1
-  }
-  if [ "$remote_herdr_session" != fm-remote ] || [ "${remote_target%%:*}" != "$remote_herdr_session" ]; then
-    fm_lock_release "$remote_lock" || true
-    fm_lock_release "$registry_lock" || true
-    fm_lock_release "$SPAWN_TASK_LOCK" || true
-    echo "error: remote launch returned Herdr session '${remote_herdr_session:-missing}', expected 'fm-remote'; preserving the remote route for reconciliation" >&2
+    echo "error: remote launch returned a different harness; preserving route for reconciliation" >&2
     return 1
   fi
   # Record what the remote endpoint ACTUALLY carries, read back from its own
@@ -1529,7 +1531,13 @@ spawn_remote_secondmate() {
     echo "remote_host=$host"
     echo "remote_root=$root"
     echo "remote_backend=$remote_backend"
-    echo "remote_herdr_session=$remote_herdr_session"
+    if [ "$remote_backend" = hc ]; then
+      echo "remote_hc_session=$SECONDMATE_REGISTRY_HC_SESSION"
+      echo "remote_hc_core_id=$SECONDMATE_REGISTRY_HC_CORE"
+      echo "remote_hc_terminal=${remote_target#*:}"
+    else
+      echo "remote_herdr_session=$remote_herdr_session"
+    fi
     echo "remote_target=$remote_target"
     [ -z "$remote_recorded_traceparent" ] || echo "traceparent=$remote_recorded_traceparent"
   } >"$tmp"

@@ -932,7 +932,7 @@ FM_FAKE_SSH_MODE=launch-nonherdr-route remote_env "$ROOT/bin/fm-spawn.sh" ios --
 nonherdr_parent_rc=$?
 set -e
 [ "$nonherdr_parent_rc" -ne 0 ] || fail "parent accepted a non-herdr remote launch route"
-assert_grep "remote launch returned backend 'tmux', expected herdr" "$TMP_ROOT/spawn-nonherdr-route.out" \
+assert_grep "remote launch returned an invalid or mismatched endpoint/core receipt" "$TMP_ROOT/spawn-nonherdr-route.out" \
   "parent refusal did not name the returned remote backend"
 cmp -s "$TMP_ROOT/parent-ios-before-nonherdr.meta" "$PARENT/state/ios.meta" \
   || fail "parent rewrote its endpoint metadata after a non-herdr route refusal"

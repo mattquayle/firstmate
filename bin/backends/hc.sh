@@ -136,17 +136,45 @@ EOF
   return 0
 }
 
+# A native remote home pins its destination core in its seeded parent record.
+# The host-local control delegate passes the same pin explicitly. Ordinary local
+# homes retain CLI behavior; a native pin uses existing-only protocol operations
+# with the hello identity proved on the SAME socket as the requested operation.
+fm_backend_hc_expected_core() { # <session> -> core id or empty for legacy/local
+  if [ -e "$FM_HOME/.fm-secondmate-parent" ] || [ -L "$FM_HOME/.fm-secondmate-parent" ]; then
+    # shellcheck source=bin/fm-secondmate-parent-lib.sh
+    . "$FM_BACKEND_LIB_DIR/fm-secondmate-parent-lib.sh"
+    fm_secondmate_parent_record_parse "$FM_HOME/.fm-secondmate-parent" || return 1
+    if [ "$FM_SECONDMATE_PARENT_BACKEND" = hc ]; then
+      [ "$1" = "$FM_SECONDMATE_PARENT_HC_SESSION" ] || return 1
+      [ "${FM_HC_EXPECT_CORE-$FM_SECONDMATE_PARENT_HC_CORE}" = "$FM_SECONDMATE_PARENT_HC_CORE" ] || return 1
+      printf '%s' "$FM_SECONDMATE_PARENT_HC_CORE"
+      return 0
+    fi
+  fi
+  if [ "${FM_HC_EXPECT_CORE+x}" = x ]; then
+    [[ "$FM_HC_EXPECT_CORE" =~ ^[A-Za-z0-9_-]+$ ]] || return 1
+    printf '%s' "$FM_HC_EXPECT_CORE"
+  fi
+  return 0
+}
+
 # fm_backend_hc_env_run: run the resolved binary with exactly <session>'s env
 # pins. Ambient HC_TERMINAL_* routing markers are always stripped. An
 # inherited HC_SOCKET is stripped because hc lets it win over HC_SESSION;
 # FM_HC_SOCKET is the deliberate pin used by tests and the lab instead.
 fm_backend_hc_env_run() {  # <session> <args...>
-  local session=$1 bin
+  local session=$1 bin core
   shift
   bin=$(fm_backend_hc_bin) || {
     echo "error: backend=hc selected but no 'herdr-core' or 'hc' binary was found on PATH (install Herdr Core per docs/hc-backend.md or set FM_HC_BIN)" >&2
     return 1
   }
+  core=$(fm_backend_hc_expected_core "$session") || return 1
+  if [ -n "$core" ]; then
+    python3 "$FM_BACKEND_LIB_DIR/fm-hc-screen.py" --cli "$session" "$core" "$@"
+    return $?
+  fi
   if [ -n "${FM_HC_SOCKET:-}" ]; then
     env -u HC_TERMINAL_ID -u HC_TERMINAL_SOCKET -u HC_SCOPE \
       HC_SESSION="$session" HC_SOCKET="$FM_HC_SOCKET" "$bin" "$@"
@@ -296,24 +324,25 @@ fm_backend_hc_target_ready() {  # <target> [expected-label]
 
 # fm_backend_hc_hello: the generation handshake for <session> over `hc
 # connect`. Prints the negotiated generation, nothing on failure.
-fm_backend_hc_hello() {  # <session>
-  local session=$1 out gen
-  out=$(printf '{"jsonrpc":"2.0","method":"hello","params":{"generation":%s},"id":1}\n' \
-      "$FM_BACKEND_HC_GENERATION" \
-    | fm_backend_hc_env_run "$session" connect --session "$session" 2>/dev/null) || return 1
-  gen=$(printf '%s' "$out" | jq -r '.result.generation // empty' 2>/dev/null)
-  [ -n "$gen" ] || return 1
-  printf '%s' "$gen"
+fm_backend_hc_hello_json() { # <session>; normalized hello result
+  local core
+  core=$(fm_backend_hc_expected_core "$1") || return 1
+  if [ -n "$core" ]; then
+    python3 "$FM_BACKEND_LIB_DIR/fm-hc-screen.py" --cli "$1" "$core" hello
+  else
+    printf '{"jsonrpc":"2.0","method":"hello","params":{"generation":1},"id":1}\n' \
+      | fm_backend_hc_env_run "$1" connect --session "$1" 2>/dev/null | jq -e '.result'
+  fi
 }
 
-# Permanent core identity is separate from its selectable session name. A new
-# runtime directory can start a different core under exactly the same name.
+fm_backend_hc_hello() { # <session>
+  fm_backend_hc_hello_json "$1" | jq -er '.generation'
+}
+
+# Permanent identity is checked on every pinned operation, not just at spawn.
 fm_backend_hc_core_id() { # <session>
-  local out
-  out=$(printf '{"jsonrpc":"2.0","method":"hello","params":{"generation":1},"id":1}\n' \
-    | fm_backend_hc_env_run "$1" connect --session "$1" 2>/dev/null) || return 1
-  printf '%s' "$out" | jq -er '.result | select(.generation == 1) | .core.id |
-    select(type == "string" and test("^[A-Za-z0-9_-]+$"))' 2>/dev/null
+  fm_backend_hc_hello_json "$1" | jq -er 'select(.generation == 1) | .core.id |
+    select(type == "string" and test("^[A-Za-z0-9_-]+$"))'
 }
 
 fm_backend_hc_record_matches_core() { # <meta>
@@ -384,6 +413,7 @@ fm_backend_hc_container_ensure() {
 fm_backend_hc_parent() { # <session> -> address, or empty for standalone
   local session=$1 target='' core='' json='' binding="$FM_HOME/state/.hc-secondmate.json"
   local native=0 explicit=0 pid candidate hops=0 home
+  [ "${FM_HC_REMOTE_SUPERVISOR:-0}" != 1 ] || return 0
   fm_backend_hc_atom_valid "$session" || { echo "error: invalid hc parent session '$session'" >&2; return 1; }
   if [ -e "$binding" ] || [ -L "$binding" ]; then
     [ -f "$binding" ] && [ ! -L "$binding" ] || { echo "error: invalid native hc parent binding" >&2; return 1; }
@@ -554,13 +584,14 @@ fm_backend_hc_composer_caps() {
 }
 
 fm_backend_hc_composer_state() {  # <target> [expected-label] -> empty|pending|pending-unproven|unknown
-  local cap verdict caps identity expected_home expected_task
+  local cap verdict caps identity expected_home expected_task core
   caps=$(fm_backend_hc_composer_caps)
   if fm_backend_hc_target_ready "$1" "${2:-}" \
     && identity=$(fm_backend_hc_expected_labels "$1" "${2:-}") \
     && expected_home=${identity%%$'\t'*} && expected_task=${identity#*$'\t'} \
     && [ "$expected_task" != '*' ] \
-    && cap=$(python3 "$FM_BACKEND_LIB_DIR/fm-hc-screen.py" "$(fm_backend_hc_bin)" \
+    && core=$(fm_backend_hc_expected_core "$FM_BACKEND_HC_SESSION") \
+    && cap=$(if [ -n "$core" ]; then export FM_HC_EXPECT_CORE="$core"; fi; python3 "$FM_BACKEND_LIB_DIR/fm-hc-screen.py" "$(fm_backend_hc_bin)" \
       "$FM_BACKEND_HC_SESSION" "$FM_BACKEND_HC_ADDRESS" "$expected_home" "$expected_task" 2>/dev/null); then
     caps=$(printf 'styled=1\ncursor=0\nidentity=0\n')
   else

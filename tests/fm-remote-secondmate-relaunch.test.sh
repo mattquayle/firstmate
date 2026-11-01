@@ -86,9 +86,15 @@ esac
 printf 'relaunched %s harness=%s from=pi model=%s effort=%s backend=herdr endpoint=fm-remote:w1:p1 worktree=/srv/fm-home\n' \
   "$id" "$harness" "$model" "$effort"
 printf 'schema=fm-remote-secondmate-control.v1\n'
-printf 'backend=herdr\n'
-printf 'target=fm-remote:w1:p1\n'
-printf 'herdr_session=fm-remote\n'
+if [ -n "${FM_FAKE_NATIVE:-}" ]; then
+  [ "$FM_FAKE_NATIVE" != lost ] || exit 255
+  core=coreA
+  [ "$FM_FAKE_NATIVE" != wrong-core ] || core=other
+  printf 'backend=hc\ntarget=lab:t9\nhc_session=lab\nhc_core_id=%s\nhc_terminal=t9\n' "$core"
+  [ "$FM_FAKE_NATIVE" != duplicate ] || printf 'hc_core_id=coreA\n'
+else
+  printf 'backend=herdr\ntarget=fm-remote:w1:p1\nherdr_session=fm-remote\n'
+fi
 printf 'harness=%s\n' "$harness"
 printf 'model=%s\n' "$model"
 printf 'effort=%s\n' "$effort"
@@ -97,7 +103,7 @@ chmod +x "$FAKEBIN/fake-ssh"
 
 run_relaunch() {  # <args...>
   env FM_HOME="$HOME_DIR" FM_SSH_BIN="$FAKEBIN/fake-ssh" \
-    FM_FAKE_RELAUNCH_MODE="${FM_FAKE_RELAUNCH_MODE:-}" \
+    FM_FAKE_RELAUNCH_MODE="${FM_FAKE_RELAUNCH_MODE:-}" FM_FAKE_NATIVE="${FM_FAKE_NATIVE:-}" \
     "$ROOT/bin/fm-remote-secondmate-relaunch.sh" "$@" 2>&1
 }
 
@@ -188,5 +194,31 @@ expect_code 0 "$RC" "a confirmed remote relaunch should succeed with an armed PR
 fm_pr_poll_artifacts_valid "$HOME_DIR/state" ios "$ROOT/bin/fm-pr-poll.sh" \
   || fail "a remote relaunch broke PR poll authentication by writing harness/model/effort after pr="
 pass "a remote relaunch keeps an already-armed PR poll authenticating"
+
+# Native receipts update every endpoint dimension; ambiguous completion never
+# publishes an intended target or falls back to a local operation.
+. "$ROOT/bin/fm-secondmate-registry-lib.sh"
+printf -- '- ios - Native home (host: remote-mac; root: /srv/fm; home: /srv/fm-home; backend: hc; hc-session: lab; hc-core: coreA; scope: remote; projects: alpha; added 2026-08-01)\n' > "$HOME_DIR/data/secondmates.md"
+secondmate_registry_line_for_id "$HOME_DIR/data/secondmates.md" ios || fail 'native registry refused'
+assert_equals "$SECONDMATE_REGISTRY_BACKEND" hc 'native registry backend'
+for suffix in 'backend: hc;' 'backend: hc; hc-session: lab;' 'backend: hc; hc-session: lab; hc-core: coreA; hc-core: other;'; do
+  if secondmate_registry_parse_line "- ios - Native (host: remote-mac; root: /srv/fm; home: /srv/fm-home; $suffix scope: remote; projects: alpha; added 2026-08-01)"; then fail 'partial or duplicate native tuple accepted'; fi
+done
+reset_meta
+sed -i.bak '/^remote_backend=/d; /^remote_herdr_session=/d; /^remote_target=/d' "$HOME_DIR/state/ios.meta"
+printf 'remote_backend=hc\nremote_hc_session=lab\nremote_hc_core_id=coreA\nremote_hc_terminal=t1\nremote_target=lab:t1\n' >> "$HOME_DIR/state/ios.meta"
+FM_FAKE_NATIVE=yes
+OUT=$(run_relaunch ios codex default high); RC=$?
+expect_code 0 "$RC" "native relaunch"$'\n'"$OUT"
+assert_grep 'remote_target=lab:t9' "$HOME_DIR/state/ios.meta" 'confirmed replacement address'
+assert_grep 'remote_hc_terminal=t9' "$HOME_DIR/state/ios.meta" 'terminal receipt'
+for FM_FAKE_NATIVE in wrong-core duplicate lost; do
+  cp "$HOME_DIR/state/ios.meta" "$TMP/before-native"
+  OUT=$(run_relaunch ios codex default high); RC=$?
+  [ "$RC" -ne 0 ] || fail "accepted $FM_FAKE_NATIVE receipt"
+  cmp -s "$HOME_DIR/state/ios.meta" "$TMP/before-native" || fail "changed route on $FM_FAKE_NATIVE receipt"
+done
+unset FM_FAKE_NATIVE
+pass 'native relaunch confirms full endpoint identity and preserves metadata on wrong core, duplicate fields and SSH loss'
 
 echo "ALL TESTS PASSED"

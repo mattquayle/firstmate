@@ -2,7 +2,7 @@
 # Register and provision a whole secondmate home on an SSH-reachable host.
 #
 # Usage:
-#   fm-remote-home-seed.sh <id> <ssh-alias> <remote-root> <remote-home> {<project>[=<origin-url>]...|--no-projects}
+#   fm-remote-home-seed.sh <id> <ssh-alias> <remote-root> <remote-home> [--backend hc --hc-session NAME --hc-core-id ID] {<project>[=<origin-url>]...|--no-projects}
 #
 # The SSH alias must already reach a host whose non-interactive PATH exposes the
 # fixed fm-remote-entrypoint.sh from <remote-root>. The command records the
@@ -83,7 +83,26 @@ case "$REMOTE_ROOT/" in "$REMOTE_HOME/"*) die "remote code root must not be insi
 NO_PROJECTS=0
 PROJECT_NAMES=()
 PROJECT_ORIGINS=()
-for arg in "$@"; do
+REMOTE_BACKEND=herdr
+REMOTE_HC_SESSION=
+REMOTE_HC_CORE=
+SEEN_NATIVE_OPTIONS=" "
+while [ "$#" -gt 0 ]; do
+  arg=$1; shift
+  case "$arg" in
+    --backend|--hc-session|--hc-core-id)
+      case "$SEEN_NATIVE_OPTIONS" in *" $arg "*) usage ;; esac
+      SEEN_NATIVE_OPTIONS="$SEEN_NATIVE_OPTIONS$arg "
+      [ "$#" -gt 0 ] || die "missing value for $arg"
+      case "$arg" in
+        --backend) REMOTE_BACKEND=$1 ;;
+        --hc-session) REMOTE_HC_SESSION=$1 ;;
+        --hc-core-id) REMOTE_HC_CORE=$1 ;;
+      esac
+      shift
+      continue
+      ;;
+  esac
   if [ "$arg" = --no-projects ]; then
     NO_PROJECTS=1
   else
@@ -99,6 +118,14 @@ for arg in "$@"; do
     PROJECT_ORIGINS+=("$origin")
   fi
 done
+case "$REMOTE_BACKEND" in
+  hc)
+    [[ "$REMOTE_HC_SESSION" =~ ^[A-Za-z0-9_][A-Za-z0-9._-]*$ ]] \
+      && [[ "$REMOTE_HC_CORE" =~ ^[A-Za-z0-9_-]+$ ]] || die "hc requires an explicit valid session and permanent core id"
+    ;;
+  herdr) [ -z "$REMOTE_HC_SESSION$REMOTE_HC_CORE" ] || die "hc pins require --backend hc" ;;
+  *) die "remote secondmate backend must be herdr or hc" ;;
+esac
 if [ "$NO_PROJECTS" -eq 1 ]; then
   [ "${#PROJECT_NAMES[@]}" -eq 0 ] || die "--no-projects cannot be combined with project names"
 else
@@ -119,6 +146,9 @@ if [ -e "$REG" ] || [ -L "$REG" ]; then
       && [ "$SECONDMATE_REGISTRY_HOST" = "$HOST" ] \
       && [ "$SECONDMATE_REGISTRY_ROOT" = "$REMOTE_ROOT" ] \
       && [ "$SECONDMATE_REGISTRY_HOME" = "$REMOTE_HOME" ] \
+      && [ "$SECONDMATE_REGISTRY_BACKEND" = "$REMOTE_BACKEND" ] \
+      && [ "$SECONDMATE_REGISTRY_HC_SESSION" = "$REMOTE_HC_SESSION" ] \
+      && [ "$SECONDMATE_REGISTRY_HC_CORE" = "$REMOTE_HC_CORE" ] \
       || die "secondmate $ID is already registered to a different local or remote home"
   fi
 fi
@@ -213,6 +243,9 @@ done
   # back; the parent's real filesystem path is never sent, since it names
   # nothing on the remote filesystem.
   printf 'parent_host_b64=%s\n' "$(printf '%s' "$HOST" | encode)"
+  if [ "$REMOTE_BACKEND" = hc ]; then
+    printf 'backend=hc\nhc_session=%s\nhc_core_id=%s\n' "$REMOTE_HC_SESSION" "$REMOTE_HC_CORE"
+  fi
   printf 'project_count=%s\n' "${#PROJECT_NAMES[@]}"
   cat "$TMP/project.records"
 } > "$TMP/manifest"
@@ -223,8 +256,10 @@ MANIFEST_BYTES=$(LC_ALL=C wc -c < "$TMP/manifest" | tr -d ' ')
 TODAY=$(date +%F)
 REG_TMP="$TMP/secondmates.next"
 if [ -f "$REG" ]; then grep -vE "^- $ID( |$)" "$REG" > "$REG_TMP" || true; else : > "$REG_TMP"; fi
-printf -- '- %s - %s (host: %s; root: %s; home: %s; scope: %s; projects: %s; added %s)\n' \
-  "$ID" "$SUMMARY" "$HOST" "$REMOTE_ROOT" "$REMOTE_HOME" "$SCOPE" "$PROJECTS_CSV" "$TODAY" >> "$REG_TMP"
+NATIVE_FIELDS=
+[ "$REMOTE_BACKEND" != hc ] || NATIVE_FIELDS=" backend: hc; hc-session: $REMOTE_HC_SESSION; hc-core: $REMOTE_HC_CORE;"
+printf -- '- %s - %s (host: %s; root: %s; home: %s;%s scope: %s; projects: %s; added %s)\n' \
+  "$ID" "$SUMMARY" "$HOST" "$REMOTE_ROOT" "$REMOTE_HOME" "$NATIVE_FIELDS" "$SCOPE" "$PROJECTS_CSV" "$TODAY" >> "$REG_TMP"
 mv -f -- "$REG_TMP" "$REG"
 if ! secondmate_registry_validate_bindings "$REG" secondmate_registry_path_key "$ID" "$REMOTE_HOME"; then
   if [ "$REG_EXISTED" -eq 1 ]; then cp "$TMP/registry.before" "$REG"; else rm -f -- "$REG"; fi

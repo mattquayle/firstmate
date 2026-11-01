@@ -13,7 +13,7 @@ Prerequisites:
 
 - Herdr Core at version 0.1.14 or later, self-identifying as `hc x.y.z`, and a core speaking protocol generation 1.
   Binary resolution uses an executable `FM_HC_BIN` override first, then `herdr-core` on `PATH`, then the `hc` alias.
-  `hc` starts its own core on first use.
+  Local `hc` CLI usage starts its own core on first use; [native remote routes](remote-secondmates.md#native-core-and-app-identity) require an existing core and refuse automatic startup.
   [`bin/fm-install-hc.sh`](../bin/fm-install-hc.sh) owns installation usage and the checksum-verified release pin; updates remain operator-run.
 - `jq` for JSON responses.
 - Native secondmates additionally require hc 0.1.16 or later and Python 3 for read-only styled observation.
@@ -103,7 +103,8 @@ Herdr UI display itself is not verified; no UI changes are required by this adap
 
 ## Persistent secondmates
 
-Local seeded secondmate homes use the ordinary spawn, durable inbox, parent reporting, control, and liveness-recovery paths.
+Seeded secondmate homes use the ordinary spawn, durable inbox, parent reporting, control, and liveness-recovery paths.
+[Remote secondmates](remote-secondmates.md#where-the-remote-agent-runs) reuse those destination-local owners through the existing SSH transport.
 [`bin/fm-hc-secondmate-lib.sh`](../bin/fm-hc-secondmate-lib.sh) owns the native home binding and launch/readiness mechanics.
 Startup binds the home lock to the actual harness descendant of the recorded terminal incarnation, so a caller supplying another `FM_HOME` cannot claim it.
 Live, malformed, symlinked, or foreign ownership refuses launch without stealing the lock.

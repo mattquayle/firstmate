@@ -21,15 +21,32 @@ Firstmate does not support placing an individual worker remotely or failing a re
 
 ## Where the remote agent runs
 
-The remote second-mate agent itself always runs on the [Herdr backend](herdr-backend.md) in the shared `fm-remote` session.
-Every path that provisions or launches one refuses a host that is not ready for it.
+The route selects the destination-local backend explicitly; the SSH transport, account worker, durable inbox and reply mirror are shared by both routes.
+Legacy routes use the [Herdr backend](herdr-backend.md) in the reserved `fm-remote` session, whose server belongs to the host's GUI login session independently of SSH.
+That session is separate from the user's interactive `default` session.
+Native Linux routes select [hc](hc-backend.md), managed Codex with `--no-daemon`, an existing session and its permanent core ID through [`fm-remote-home-seed.sh`](../bin/fm-remote-home-seed.sh).
+Native readiness reports missing tools or core availability without automatic repair or core startup.
 
-- `fm-remote` is reserved for remote fleet work and must not be used for personal work.
-- The user's interactive Herdr session remains `default` and is not a remote-secondmate prerequisite.
-- Herdr's remote-session server belongs to the host's own GUI login session rather than to the SSH connection.
-  As a result, the agent's endpoint survives every disconnection the primary's supervision depends on.
-- Local second mates are unaffected and keep their ordinary backend and session selection.
-  So do the workers a remote second mate supervises inside its own home.
+The remote native supervisor is standalone on its destination core.
+Destination-local hc children link to that supervisor through its native home binding and have independent lifetimes.
+The remote home still chooses its workers' backend through the ordinary configuration; selecting a native supervisor does not rewrite inherited worker configuration.
+Local secondmates retain their existing behavior.
+
+### Native core and app identity
+
+A native route binds the SSH alias, remote code root and home, hc session, permanent core ID, and confirmed destination-local terminal address.
+The registry's native tuple is immutable during ordinary reseeding; changing it requires explicit reconciliation of the old endpoint and home.
+The seeded parent record authorizes the host-local code root to control only that home's parent-route state.
+Local kernel PID incarnation and harness ancestry continue to own the home lock; no Spark PID is interpreted on the remote host.
+Each native operation connects to an existing owned socket, validates the permanent core ID on that same connection, then issues its bounded operation without reconnecting or starting a core.
+Missing sockets, changed cores, ambiguous responses and SSH loss preserve the route and work for reconciliation, never launch locally, and never retry an uncertain launch automatically.
+The receipt parser in [`fm-secondmate-registry-lib.sh`](../bin/fm-secondmate-registry-lib.sh) owns complete endpoint confirmation after launch and relaunch.
+
+Herdr.app must have its own durable machine entry reaching this destination core; a Spark SSH alias or Spark core roster alone does not configure the app.
+The app prefixes remote terminal and parent addresses with its machine alias, while Firstmate controls destination-local addresses over SSH.
+Names and `herdr.space`/`herdr.tab` labels follow the [hc adapter](hc-backend.md#task-shape-and-metadata).
+Native parent relationships do not guarantee a deduplicated Agents sidebar: the app may show both tab rows and nested children.
+App rendering and a credentialed cross-host lifecycle require verification on the intended app/device setup before operational readiness is claimed.
 
 ## Prerequisites
 
@@ -429,15 +446,16 @@ The primary then takes these steps:
 1. It resolves the verified secondmate harness and optional model and effort.
 2. It runs the same readiness gate the seed runs.
 3. It transfers the inherited-material allowlist.
-4. It asks the remote host to launch on Herdr in `fm-remote`.
+4. It asks the remote host to launch on the registered backend and validates the returned endpoint identity.
 
-All remote secondmates on one host share `fm-remote` and retain separate `2ndmate-<id>` workspaces inside it.
+Legacy routes share `fm-remote` and retain separate `2ndmate-<id>` workspaces; native placement follows [the bound core](#native-core-and-app-identity).
 
 ### Refused and unsupported launches
 
-- An explicit request for any other backend is refused rather than honored, and the remote host refuses one too.
+- An explicit backend that disagrees with the registered and seeded route is refused on both sides.
 - An existing remote endpoint recorded in another Herdr session, including `default`, is classified as unverified and left untouched.
   Launch, liveness recovery, control, and retirement refuse it until an operator explicitly migrates it, instead of attempting a live cutover.
+- Native routes refuse changed core/session identities and incompatible or incomplete endpoint receipts; core restarts and configuration migration are operator actions.
 - A launch after a host has drifted out of readiness fails with the doctor's own gap text instead of leaving a half-created endpoint.
 - Raw launch commands are not accepted for remote secondmates.
 - Backends that already refuse secondmate launch, currently Orca, cmux, and paseo, remain unsupported on the remote host.

@@ -2,15 +2,16 @@
 # Check, and optionally repair, one remote account's second-mate readiness.
 #
 # Usage:
-#   bin/fm-on.sh <secondmate-id|ssh-alias> fm-remote-doctor.sh [--fix]
+#   bin/fm-on.sh <secondmate-id|ssh-alias> fm-remote-doctor.sh [--fix] [--backend hc --hc-session NAME --hc-core-id ID]
 #
 # Run it through fm-on.sh so the fixed entrypoint invokes this readiness owner
 # over its plain SSH bootstrap. The command reports the same filesystem-composed
 # PATH used by worker jobs while retaining authority to inspect and repair the
 # worker itself.
 #
-# A remote second mate always runs on the Herdr backend in the dedicated
-# fm-remote session. Its account therefore needs the Firstmate-owned Aqua Herdr
+# Native Linux routes select an existing hc core explicitly and never start or
+# repair that core. The optional native tuple is all-or-nothing. Legacy routes
+# use the Herdr backend in fm-remote; their account needs the Firstmate-owned Aqua Herdr
 # agent plus the sibling dev.firstmate.remote-job worker that runs normal fm-on
 # commands through the Aqua or Linux job-worker path. On darwin, that Herdr
 # agent runs bin/fm-remote-herdr-guard.sh through the remote account's login
@@ -84,17 +85,40 @@ ENTRYPOINT_LINK="${HOME:-}/.local/bin/fm-remote-entrypoint.sh"
 usage() { sed -n '2,5p' "$0" | sed 's/^# \{0,1\}//'; exit 2; }
 
 MODE=check
-case "${1:-}" in
-  '') ;;
-  --fix) MODE=fix; shift ;;
-  --worker-tool-probe)
-    [ "${FM_REMOTE_JOB_ACTIVE:-}" = 1 ] || { printf 'error: worker tool probe requires the remote job worker\n' >&2; exit 64; }
-    MODE='worker-tool-probe'
-    shift
+NATIVE_SESSION=
+NATIVE_CORE=
+SELECTED_BACKEND=herdr
+SEEN_NATIVE_OPTIONS=" "
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --fix) MODE=fix ;;
+    --worker-tool-probe)
+      [ "${FM_REMOTE_JOB_ACTIVE:-}" = 1 ] || exit 64
+      MODE="worker-tool-probe" ;;
+    --backend|--hc-session|--hc-core-id)
+      case "$SEEN_NATIVE_OPTIONS" in *" $1 "*) usage ;; esac
+      SEEN_NATIVE_OPTIONS="$SEEN_NATIVE_OPTIONS$1 "
+      option=$1; shift; [ "$#" -gt 0 ] || usage
+      case "$option" in
+        --backend) SELECTED_BACKEND=$1 ;;
+        --hc-session) NATIVE_SESSION=$1 ;;
+        --hc-core-id) NATIVE_CORE=$1 ;;
+      esac ;;
+    *) usage ;;
+  esac
+  shift
+done
+NATIVE_ARGS=()
+case "$SELECTED_BACKEND" in
+  hc)
+    [[ "$NATIVE_SESSION" =~ ^[A-Za-z0-9_][A-Za-z0-9._-]*$ ]] && [[ "$NATIVE_CORE" =~ ^[A-Za-z0-9_-]+$ ]] || usage
+    REQUIRED_TOOLS=(git jq python3 tasks-axi treehouse)
+    HARNESS_TOOLS=(codex)
+    NATIVE_ARGS=(--backend hc --hc-session "$NATIVE_SESSION" --hc-core-id "$NATIVE_CORE")
     ;;
+  herdr) [ -z "$NATIVE_SESSION$NATIVE_CORE" ] || usage ;;
   *) usage ;;
 esac
-[ "$#" -eq 0 ] || usage
 
 PLATFORM=$(fm_remote_job_platform)
 UID_NUM=$(id -u 2>/dev/null) || UID_NUM=
@@ -453,7 +477,7 @@ report_required_tools_from_worker() {
   local job_id probe_stdout probe_stderr probe_exit line fact name value
   local expected=6 count=0 valid=1 seen=' '
   if ! job_id=$(fm_remote_job_stage "${HOME:-}" "$FM_ROOT" "${FM_HOME:-}" \
-    fm-remote-doctor.sh --worker-tool-probe </dev/null); then
+    fm-remote-doctor.sh --worker-tool-probe "${NATIVE_ARGS[@]}" </dev/null); then
     set_check remote-job-probe "fixable: the remote job worker could not accept the required-tool probe" \
       "rerun this command with --fix to restart the worker"
     report_required_tools
@@ -475,7 +499,7 @@ report_required_tools_from_worker() {
     fact=${line#required }
     name=${fact%%=*}
     value=${fact#*=}
-    case "$name" in git|jq|herdr|tasks-axi|treehouse|harness) ;; *) valid=0; continue ;; esac
+    case "$name" in git|jq|herdr|python3|tasks-axi|treehouse|harness) ;; *) valid=0; continue ;; esac
     case "$seen" in *" $name "*) valid=0; continue ;; esac
     seen="$seen$name "
     count=$((count + 1))
@@ -718,16 +742,44 @@ check_entrypoint_link() {
     "rerun this command with --fix to create it"
 }
 
+# Native hc is an existing destination core, not a doctor-managed service.
+# No status/connect CLI here: hc 0.1.16 autostarts even for reads on Unix.
+check_native_hc() {
+  local out
+  if [ "$PLATFORM" != linux ]; then
+    record native-core "human: native remote hc currently requires Linux" "use the legacy route on this platform"
+    return
+  fi
+  # shellcheck source=bin/fm-backend.sh
+  . "$SCRIPT_DIR/fm-backend.sh"
+  fm_backend_source hc
+  if ! fm_backend_hc_secondmate_runtime_check || ! fm_backend_hc_codex_launch_check; then
+    record native-core "human: hc >=0.1.16, Python 3 and Codex --no-daemon are required" "install the required tools after approval"
+  elif out=$(python3 "$SCRIPT_DIR/fm-hc-screen.py" --cli "$NATIVE_SESSION" "$NATIVE_CORE" hello 2>&1); then
+    if printf '%s' "$out" | jq -e '["server.status","terminal.list","terminal.run","terminal.get","terminal.read","terminal.attach","terminal.send","terminal.keys","terminal.kill","terminal.rm"] - .methods == []' >/dev/null 2>&1; then
+      record native-core "ok: existing session $NATIVE_SESSION core $NATIVE_CORE"
+    else
+      record native-core "human: selected core lacks required generation-1 methods" "verify the installed core release without restarting shared services"
+    fi
+  else
+    record native-core "human: selected existing hc core is unavailable or changed: $out" "verify the intended core; automatic start/restart is forbidden"
+  fi
+}
+
 run_checks() { # <resolved-login-shell>
   local shell=$1
   CHECK_NAMES=()
   CHECK_VALUES=()
   CHECK_ACTIONS=()
-  check_herdr
-  check_gui_session
+  if [ "$SELECTED_BACKEND" = hc ]; then
+    check_native_hc
+  else
+    check_herdr
+    check_gui_session
+    check_launch_agent "$shell"
+    check_herdr_server
+  fi
   check_remote_job_worker
-  check_launch_agent "$shell"
-  check_herdr_server
   check_entrypoint_link
 }
 
@@ -877,6 +929,8 @@ apply_fixes() { # <resolved-login-shell>
   done
 }
 
+# Native options: --backend hc --hc-session NAME --hc-core-id ID.
+# Native --fix may repair Firstmate transport only; it never starts an hc core.
 # --- report -----------------------------------------------------------------
 
 if [ "$MODE" = worker-tool-probe ]; then

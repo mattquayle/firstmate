@@ -142,6 +142,18 @@ fm_hc_secondmate_parent_matches() { # <home> <parent>
     recorded=$(cd "$FM_SECONDMATE_PARENT_HOME" && pwd -P) || return 1
     [ "$recorded" != "$parent" ] || return 0
   fi
-  echo "error: hc secondmate home is not seeded for this local parent; refusing launch" >&2
+  # A remote parent is represented by its seeded host-local control delegate.
+  # This authorizes only the delegate's exact state/home tuple; the child's
+  # lock, PID incarnation and ancestry checks above are unchanged.
+  if fm_secondmate_parent_record_parse "$1/.fm-secondmate-parent" \
+    && [ "$FM_SECONDMATE_PARENT_ROUTE" = remote ] \
+    && [ "$FM_SECONDMATE_PARENT_BACKEND" = hc ] \
+    && [ "$FM_SECONDMATE_CONTROL_ROOT" = "$parent" ] \
+    && [ "${FM_STATE_OVERRIDE:-}" = "$1/state/parent-route" ] \
+    && [ "${FM_HC_EXPECT_CORE:-}" = "$FM_SECONDMATE_PARENT_HC_CORE" ] \
+    && [ "${HC_SESSION:-}" = "$FM_SECONDMATE_PARENT_HC_SESSION" ]; then
+    return 0
+  fi
+  echo "error: hc secondmate home is not seeded for this local parent or remote control delegate; refusing launch" >&2
   return 1
 }

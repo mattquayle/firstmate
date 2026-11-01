@@ -106,6 +106,25 @@ CHARTER_B64=$(manifest_value "$TMP/manifest" charter_b64 || true)
 # field) still provisions; the durable parent record below simply omits the
 # host in that case rather than refusing the whole seed.
 PARENT_HOST_B64=$(manifest_value "$TMP/manifest" parent_host_b64 || true)
+NATIVE_BACKEND=
+NATIVE_SESSION=
+NATIVE_CORE=
+if grep -qE '^(backend|hc_session|hc_core_id)=' "$TMP/manifest"; then
+  NATIVE_BACKEND=$(manifest_value "$TMP/manifest" backend) || die "invalid native backend field"
+  NATIVE_SESSION=$(manifest_value "$TMP/manifest" hc_session) || die "invalid native session field"
+  NATIVE_CORE=$(manifest_value "$TMP/manifest" hc_core_id) || die "invalid native core field"
+  [ "$NATIVE_BACKEND" = hc ] && [[ "$NATIVE_SESSION" =~ ^[A-Za-z0-9_][A-Za-z0-9._-]*$ ]] \
+    && [[ "$NATIVE_CORE" =~ ^[A-Za-z0-9_-]+$ ]] || die "invalid native placement"
+fi
+# shellcheck source=bin/fm-secondmate-parent-lib.sh
+. "$SCRIPT_DIR/fm-secondmate-parent-lib.sh"
+if [ -e "$FM_HOME/.fm-secondmate-parent" ] || [ -L "$FM_HOME/.fm-secondmate-parent" ]; then
+  fm_secondmate_parent_record_parse "$FM_HOME/.fm-secondmate-parent" || die "unsafe existing parent binding"
+  [ "$FM_SECONDMATE_PARENT_BACKEND" = "$NATIVE_BACKEND" ] \
+    && [ "$FM_SECONDMATE_PARENT_HC_SESSION" = "$NATIVE_SESSION" ] \
+    && [ "$FM_SECONDMATE_PARENT_HC_CORE" = "$NATIVE_CORE" ] || die "seed cannot migrate an existing endpoint binding"
+  [ "$NATIVE_BACKEND" != hc ] || [ "$FM_SECONDMATE_CONTROL_ROOT" = "$FM_ROOT" ] || die "foreign native control root"
+fi
 COUNT=$(manifest_value "$TMP/manifest" project_count || true)
 base64_decode_to "$ID_B64" "$TMP/id" || die "manifest id is not valid base64"
 base64_decode_to "$CHARTER_B64" "$TMP/charter" || die "manifest charter is not valid base64"
@@ -271,6 +290,9 @@ mv -f -- "$FM_HOME/data/projects.md.tmp.$$" "$FM_HOME/data/projects.md"
 {
   printf 'schema=fm-secondmate-parent.v1\n'
   printf 'route=remote\n'
+  if [ "$NATIVE_BACKEND" = hc ]; then
+    printf 'control_root=%s\nbackend=hc\nhc_session=%s\nhc_core_id=%s\n' "$FM_ROOT" "$NATIVE_SESSION" "$NATIVE_CORE"
+  fi
   [ -z "$PARENT_HOST" ] || printf 'parent_host=%s\n' "$PARENT_HOST"
 } > "$FM_HOME/.fm-secondmate-parent.tmp.$$"
 mv -f -- "$FM_HOME/.fm-secondmate-parent.tmp.$$" "$FM_HOME/.fm-secondmate-parent"

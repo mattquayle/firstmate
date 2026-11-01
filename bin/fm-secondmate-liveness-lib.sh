@@ -141,12 +141,22 @@ fm_secondmate_liveness_probe() {  # <meta> <id> <full|poll>
   local meta=$1 id=$2 mode=$3
   FM_SM_LIVE_STATUS=skipped FM_SM_LIVE_STATE=unknown FM_SM_LIVE_KILL=0 FM_SM_LIVE_RESUME=0
   FM_SM_LIVE_CAUSE='' FM_SM_LIVE_WHERE='' FM_SM_LIVE_REASON='' FM_SM_LIVE_LINE=''
-  local window harness remote_host remote_rc out agent_state readiness_reason route_out remote_backend
+  local window harness remote_host remote_rc out agent_state readiness_reason route_out registry
   window=$(fm_meta_get "$meta" window)
   [ -n "$window" ] || { FM_SM_LIVE_STATUS=silent; return 0; }
   harness=$(fm_meta_get "$meta" harness)
   remote_host=$(fm_meta_get "$meta" remote_host)
   if [ -n "$remote_host" ]; then
+    # The local route never supplies a host PID. Registry and confirmed remote
+    # identity must agree before even interpreting that host's liveness report.
+    # shellcheck source=bin/fm-secondmate-registry-lib.sh
+    . "$FM_SM_LIVE_LIB_DIR/fm-secondmate-registry-lib.sh"
+    registry="${FM_DATA_OVERRIDE:-${FM_HOME:-$FM_ROOT}/data}/secondmates.md"
+    if ! secondmate_remote_meta_matches "$registry" "$id" "$meta"; then
+      FM_SM_LIVE_STATUS=unverified
+      FM_SM_LIVE_REASON="remote route metadata disagrees with registry; preserving endpoint"
+      return 0
+    fi
     if [ "$mode" = full ]; then
       remote_rc=0
       fm_remote_readiness_ensure "$FM_SM_LIVE_LIB_DIR" "$id" || remote_rc=$?
@@ -194,9 +204,12 @@ fm_secondmate_liveness_probe() {  # <meta> <id> <full|poll>
             FM_SM_LIVE_REASON="alive remote endpoint route is unreadable on $remote_host; inspect and migrate or retire it explicitly"
             return 0
           fi
-          remote_backend=$(printf '%s\n' "$route_out" | sed -n 's/^backend=//p' | tail -1)
-          if [ "$remote_backend" != herdr ]; then
-            FM_SM_LIVE_REASON="alive remote endpoint is recorded on backend '${remote_backend:-missing}'; migrate or retire it explicitly"
+          if ! secondmate_remote_receipt_validate "$registry" "$id" "$route_out"; then
+            FM_SM_LIVE_REASON="alive remote endpoint receipt disagrees with registry; preserving endpoint"
+            return 0
+          fi
+          if [ "$SECONDMATE_RECEIPT_TARGET" != "$(fm_meta_get "$meta" remote_target)" ]; then
+            FM_SM_LIVE_REASON="remote terminal changed; reconcile the confirmed route before recovery"
             return 0
           fi
         fi
