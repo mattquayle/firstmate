@@ -45,7 +45,8 @@
 #              is merely unreachable from this seat. Herdr proves absence by
 #              reading the session the record names; REX proves it because its
 #              never-reused ids answer a structured not-found from the server
-#              the record names.
+#              the record names; hc requires a matching permanent core identity
+#              before accepting that core's structured not-found.
 #              Proven gone reports `endpoint-gone` rather than
 #              `already-stopped`, because the endpoint this verb normally
 #              preserves did not survive; a pane that turns out to be there and
@@ -70,7 +71,7 @@
 #              placement), and the task's record rebinds to it; that is how a task
 #              whose terminal was destroyed is reclaimed by the home that owns
 #              it, rather than being stranded with a parked approval nobody can
-#              answer. Reclaim is HERDR- and REX-ONLY for the reason `exit` gives above:
+#              answer. Reclaim also accepts an hc record with matching permanent core identity:
 #              a tmux `missing` cannot be proven absent from a task record, so
 #              it refuses.
 #              An explicit `default` model or effort clears that
@@ -132,7 +133,7 @@
 #   - A backend that cannot deliver the harness's interrupt key is refused
 #     (Orca's terminal API has no Escape).
 #   - `exit` and `relaunch` require a backend with a recovery-grade agent-state
-#     classifier (tmux, herdr, rex, or t3code), because without one the "the
+#     classifier (tmux, herdr, rex, t3code, or hc), because without one the "the
 #     agent stopped" postcondition cannot be proven. Relaunch also requires
 #     replacement support, which t3code lacks. zellij, orca, cmux, paseo, and tern are
 #     refused rather than reported as successful blind.
@@ -402,10 +403,20 @@ if [ "$BACKEND" = t3code ]; then
   fm_backend_runtime_check t3code || exit 1
 fi
 
+if [ "$BACKEND" = hc ] && { [ "$KIND" = secondmate ] || [ -n "$(fm_meta_get "$META" hc_core_id)" ]; }; then
+  fm_backend_source hc || exit 1
+  fm_backend_hc_record_matches_core "$META" || die "hc core identity is missing or changed; preserving the endpoint and task"
+fi
+if [ "$BACKEND" = hc ] && [ "$KIND" = secondmate ]; then
+  # shellcheck source=bin/fm-hc-secondmate-lib.sh
+  . "$SCRIPT_DIR/fm-hc-secondmate-lib.sh"
+  fm_hc_secondmate_control_safe "$WT" "$T" || exit 1
+fi
+
 # --- shared helpers ---------------------------------------------------------
 
 agent_state() {
-  fm_backend_agent_state "$BACKEND" "$T"
+  fm_backend_agent_state "$BACKEND" "$T" "$LABEL"
 }
 
 busy_verdict() {
@@ -1058,6 +1069,9 @@ resolve_relaunch_profile() {
     "$account_model" "$TARGET_HARNESS" "" "$account_mate" >/dev/null || return 1
   fm_omp_profile_select "$TARGET_HARNESS" "${FM_CONFIG_OVERRIDE:-$FM_HOME/config}" \
     "$account_mate" >/dev/null || return 1
+  if [ "$BACKEND" = hc ] && [ "$TARGET_HARNESS" = codex ]; then
+    fm_backend_hc_codex_launch_check || return 1
+  fi
   # Likewise polytoken's launch profile and wiring refusals
   # (bin/fm-polytoken-lib.sh owns them). The launch owner retires the prior
   # incarnation's own generated hook layer, so only one it did not generate

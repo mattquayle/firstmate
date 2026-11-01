@@ -87,10 +87,11 @@
 #                                   home's one live T3 thread - then firstmate:0
 #                                   fallback). Accepts a tmux target, a herdr
 #                                   "<session>:<pane-id>", a rex target, or a T3
-#                                   thread id; which one it's read as is decided
+#                                   thread id, or an hc <session>:<address>;
+#                                   which one it's read as is decided
 #                                   by FM_SUPERVISOR_BACKEND (below),
 #                                   independently.
-#          FM_SUPERVISOR_BACKEND    supervisor endpoint BACKEND (tmux|herdr|rex|t3code;
+#          FM_SUPERVISOR_BACKEND    supervisor endpoint BACKEND (tmux|herdr|rex|t3code|hc;
 #                                   override; otherwise resolved by
 #                                   bin/fm-supervisor-target-lib.sh - $TMUX_PANE
 #                                   selects tmux, $HERDR_ENV=1 selects herdr,
@@ -217,7 +218,7 @@ FM_HOME="${FM_HOME:-${FM_ROOT_OVERRIDE:-$FM_ROOT}}"
 # instead of silently running tmux primitives against a pane that is not a tmux
 # pane. t3code injects through the adapter's t3_thread_send, with its
 # thread status table as the busy verdict.
-FM_SUPERVISOR_SUPPORTED_BACKENDS="tmux herdr rex t3code"
+FM_SUPERVISOR_SUPPORTED_BACKENDS="tmux herdr rex t3code hc"
 INJECT_SKIP_DEFAULT="heartbeat"
 STALE_ESCALATE_SECS_DEFAULT=240
 ESCALATE_BATCH_SECS_DEFAULT=90
@@ -2039,7 +2040,7 @@ fm_super_main() {
   # refusal the task calls for, instead of a confusing "does not resolve to a
   # tmux pane" error.
   if ! fm_backend_list_contains "$FM_SUPERVISOR_SUPPORTED_BACKENDS" "$BACKEND"; then
-    echo "error: away-mode daemon does not support supervisor backend '$BACKEND' yet (supported: $FM_SUPERVISOR_SUPPORTED_BACKENDS); set FM_SUPERVISOR_BACKEND=tmux|herdr|rex|t3code and FM_SUPERVISOR_TARGET to run firstmate's own pane under a supported backend" >&2
+    echo "error: away-mode daemon does not support supervisor backend '$BACKEND' yet (supported: $FM_SUPERVISOR_SUPPORTED_BACKENDS); set FM_SUPERVISOR_BACKEND and FM_SUPERVISOR_TARGET to a supported endpoint" >&2
     log "startup failed: unsupported supervisor backend '$BACKEND' (source=$backend_source)"
     fm_lock_release "$LOCK" 2>/dev/null || true
     rm -f "$PIDFILE" 2>/dev/null || true

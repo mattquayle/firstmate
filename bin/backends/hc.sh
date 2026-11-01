@@ -25,8 +25,9 @@
 # terminal still reaches the recorded core.
 #
 # Identity: each task terminal carries the labels firstmate.task=<window-label>
-# and firstmate.home=<hometag> (bin/fm-backend-hometag-lib.sh). Operations that
-# receive an expected label refuse a terminal whose labels do not match, so a
+# and firstmate.home=<hometag> (the physical FM_HOME, via
+# bin/fm-backend-hometag-lib.sh). Operations refuse foreign home labels and,
+# when given an expected task label, require it too, so a
 # recorded address can never steer input into another home's terminal. hc
 # names are not used: they allow only 1-32 of [a-z0-9_-], narrower than task ids.
 #
@@ -191,7 +192,43 @@ fm_backend_hc_parse_target() {  # <target>
 }
 
 fm_backend_hc_scoped_label() {  # <window-label>
-  printf '%s-%s' "$(fm_backend_hometag)" "$1"
+  printf '%s-%s' "$(fm_backend_hc_hometag)" "$1"
+}
+
+# Runtime ownership follows the operational home even when several homes use
+# one tracked code root. Keep other backends' existing tag derivation unchanged.
+fm_backend_hc_hometag() {
+  FM_ROOT=$FM_HOME fm_backend_hometag
+}
+
+fm_backend_hc_expected_labels() { # <target> [expected-task]; prints home<TAB>task
+  local id meta
+  case "${2:-}" in
+    fm-*)
+      id=${2#fm-}
+      case "$id" in ''|*[!A-Za-z0-9._-]*) return 1 ;; esac
+      meta="${FM_STATE_OVERRIDE:-$FM_HOME/state}/$id.meta"
+      if [ -e "$meta" ] || [ -L "$meta" ]; then
+        # Includes inbox re-rings: a reused address on a replacement core must
+        # never receive input just because it copied this home's labels.
+        if grep -qE '^(kind=secondmate|hc_core_id=)' "$meta"; then
+          fm_backend_validate_task_endpoint "$meta" "$id" >/dev/null 2>&1 \
+            && [ "$FM_BACKEND_VALIDATED_BACKEND" = hc ] \
+            && fm_backend_hc_record_matches_core "$meta" || return 1
+        fi
+      fi
+      ;;
+  esac
+  if [ -z "${2:-}" ] && [ -e "$FM_HOME/state/.hc-secondmate.json" ] \
+    && [ "$(jq -r '.target // empty' "$FM_HOME/state/.hc-secondmate.json" 2>/dev/null)" = "$1" ]; then
+    # A secondmate's own supervisor endpoint is labelled by its parent home.
+    # Only its live, ancestry-bound home lock may authorize that exception.
+    # shellcheck source=bin/fm-hc-secondmate-lib.sh
+    . "$FM_BACKEND_LIB_DIR/fm-hc-secondmate-lib.sh"
+    fm_hc_secondmate_self_identity "$FM_HOME" "$1" && return 0
+    return 1
+  fi
+  printf '%s\t%s' "$(fm_backend_hc_hometag)" "${2:-*}"
 }
 
 # fm_backend_hc_get: `hc get --json` of the parsed target. Status 3 is hc's
@@ -206,12 +243,19 @@ fm_backend_hc_get() {  # <target>
 # terminal is `foreign` when [expected-label] is given and its labels do not
 # carry this home's labels for it; `*` accepts any task label of this home.
 fm_backend_hc_endpoint_state() {  # <target> [expected-label]
-  local target=$1 expected=${2:-} json rc fields state task home
+  local target=$1 expected=${2:-} json rc
   fm_backend_hc_parse_target "$target" || { printf 'unreadable'; return 0; }
-  json=$(fm_backend_hc_get "$target")
-  rc=$?
+  if json=$(fm_backend_hc_get "$target"); then rc=0; else rc=$?; fi
   if [ "$rc" -eq 3 ]; then printf 'absent'; return 0; fi
   [ "$rc" -eq 0 ] || { printf 'unreadable'; return 0; }
+  fm_backend_hc_snapshot_state "$target" "$expected" "$json"
+}
+
+fm_backend_hc_snapshot_state() { # <target> <expected-label> <get-json>
+  local target=$1 expected=$2 json=$3 fields state task home identity expected_home
+  printf '%s' "$json" | jq -e --arg addr "${target#*:}" '.address == $addr
+    and (.labels | type == "object") and (.state | type == "string")' >/dev/null 2>&1 \
+    || { printf 'unreadable'; return 0; }
   fields=$(printf '%s' "$json" | jq -r '[.state // "", .labels["firstmate.task"] // "", .labels["firstmate.home"] // ""] | @tsv' 2>/dev/null) || {
     printf 'unreadable'
     return 0
@@ -219,7 +263,10 @@ fm_backend_hc_endpoint_state() {  # <target> [expected-label]
   IFS=$'\t' read -r state task home <<EOF
 $fields
 EOF
-  if [ -n "$expected" ] && { [ "$home" != "$(fm_backend_hometag)" ] \
+  identity=$(fm_backend_hc_expected_labels "$target" "$expected") || { printf 'foreign'; return 0; }
+  expected_home=${identity%%$'\t'*}
+  expected=${identity#*$'\t'}
+  if { [ "$home" != "$expected_home" ] \
     || { [ "$expected" = '*' ] && [ -z "$task" ]; } \
     || { [ "$expected" != '*' ] && [ "$task" != "$expected" ]; }; }; then
     printf 'foreign'
@@ -248,6 +295,42 @@ fm_backend_hc_hello() {  # <session>
   gen=$(printf '%s' "$out" | jq -r '.result.generation // empty' 2>/dev/null)
   [ -n "$gen" ] || return 1
   printf '%s' "$gen"
+}
+
+# Permanent core identity is separate from its selectable session name. A new
+# runtime directory can start a different core under exactly the same name.
+fm_backend_hc_core_id() { # <session>
+  local out
+  out=$(printf '{"jsonrpc":"2.0","method":"hello","params":{"generation":1},"id":1}\n' \
+    | fm_backend_hc_env_run "$1" connect --session "$1" 2>/dev/null) || return 1
+  printf '%s' "$out" | jq -er '.result | select(.generation == 1) | .core.id |
+    select(type == "string" and test("^[A-Za-z0-9_-]+$"))' 2>/dev/null
+}
+
+fm_backend_hc_record_matches_core() { # <meta>
+  local recorded session current
+  recorded=$(fm_backend_meta_exact_value "$1" hc_core_id) || return 1
+  session=$(fm_backend_meta_exact_value "$1" hc_session) || return 1
+  fm_backend_hc_atom_valid "$recorded" && fm_backend_hc_atom_valid "$session" || return 1
+  current=$(fm_backend_hc_core_id "$session") || return 1
+  [ "$recorded" = "$current" ]
+}
+
+fm_backend_hc_secondmate_runtime_check() {
+  local FM_BACKEND_HC_MIN_VERSION=0.1.16
+  fm_backend_hc_version_check || return 1
+  command -v python3 >/dev/null 2>&1 || { echo "error: native hc secondmate control requires Python 3 for read-only styled observation" >&2; return 1; }
+}
+
+# A displayed Codex client may otherwise reuse a daemon outside this terminal,
+# with that daemon's home and routing environment. hc requires local execution.
+fm_backend_hc_codex_launch_check() {
+  local help
+  help=$(codex --help 2>/dev/null) || return 1
+  printf '%s\n' "$help" | grep -q -- '--no-daemon' || {
+    echo "error: hc requires a Codex CLI supporting --no-daemon so its tools stay inside the native terminal" >&2
+    return 1
+  }
 }
 
 # fm_backend_hc_container_ensure: prove the binary is herdr-core at the
@@ -281,10 +364,12 @@ fm_backend_hc_container_ensure() {
 # into any parent.
 fm_backend_hc_create_task() {  # <session> <window-label> <cwd>
   local session=$1 label=$2 cwd=$3 home scoped dup out address
-  home=$(fm_backend_hometag)
+  home=$(fm_backend_hc_hometag)
   scoped=$(fm_backend_hc_scoped_label "$label")
   dup=$(fm_backend_hc_cli "$session" ls --json --label "firstmate.task=$label" --label "firstmate.home=$home" 2>/dev/null) \
     || { echo "error: 'hc ls' failed for session '$session'; cannot create $label" >&2; return 1; }
+  printf '%s' "$dup" | jq -e 'type == "object" and (.terminals | type == "array")' >/dev/null 2>&1 \
+    || { echo "error: malformed hc inventory; refusing duplicate-unsafe create" >&2; return 1; }
   if [ -n "$(printf '%s' "$dup" | jq -r '.terminals[]?.address' 2>/dev/null)" ]; then
     echo "error: hc terminal for $label already exists in session '$session'" >&2
     return 1
@@ -353,9 +438,19 @@ fm_backend_hc_composer_caps() {
 }
 
 fm_backend_hc_composer_state() {  # <target> [expected-label] -> empty|pending|pending-unproven|unknown
-  local cap verdict
-  cap=$(fm_backend_hc_visible_capture "$1" "${2:-}") || { printf 'unknown'; return 0; }
-  verdict=$(fm_composer_classify_screen "$(fm_backend_hc_composer_caps)" "$cap")
+  local cap verdict caps identity expected_home expected_task
+  caps=$(fm_backend_hc_composer_caps)
+  if fm_backend_hc_target_ready "$1" "${2:-}" \
+    && identity=$(fm_backend_hc_expected_labels "$1" "${2:-}") \
+    && expected_home=${identity%%$'\t'*} && expected_task=${identity#*$'\t'} \
+    && [ "$expected_task" != '*' ] \
+    && cap=$(python3 "$FM_BACKEND_LIB_DIR/fm-hc-screen.py" "$(fm_backend_hc_bin)" \
+      "$FM_BACKEND_HC_SESSION" "$FM_BACKEND_HC_ADDRESS" "$expected_home" "$expected_task" 2>/dev/null); then
+    caps=$(printf 'styled=1\ncursor=0\nidentity=0\n')
+  else
+    cap=$(fm_backend_hc_visible_capture "$1" "${2:-}") || { printf 'unknown'; return 0; }
+  fi
+  verdict=$(fm_composer_classify_screen "$caps" "$cap")
   [ "$verdict" != need-identity ] || verdict=unknown
   printf '%s' "$verdict"
 }
@@ -413,8 +508,9 @@ fm_backend_hc_send_text_submit() {  # <target> <text> <retries> <enter-sleep> <s
 
 # fm_backend_hc_busy_state: hc's native agent status. `working` is busy; the
 # settled words are idle; a terminal with no reported status is unknown.
-fm_backend_hc_busy_state() {  # <target>
+fm_backend_hc_busy_state() {  # <target> [expected-label]
   local json
+  fm_backend_hc_target_ready "$1" "${2:-}" || { printf 'unknown'; return 0; }
   json=$(fm_backend_hc_get "$1") || { printf 'unknown'; return 0; }
   case "$(printf '%s' "$json" | jq -r '.status.state // empty' 2>/dev/null)" in
     working) printf 'busy' ;;
@@ -452,12 +548,15 @@ fm_backend_hc_kill() {  # <target> [unused] [expected-label]
 # host the agent again, exactly like a closed tmux window. A live terminal is
 # classified from hc's foreground process through the shared classifier.
 fm_backend_hc_agent_state() {  # <target>
-  local json rc fields state name argv0 args pid class
+  local json rc fields state name argv0 args pid class expected=${2:-}
   fm_backend_hc_parse_target "${1:-}" || { printf 'unreadable'; return 0; }
-  json=$(fm_backend_hc_get "$1")
-  rc=$?
+  if json=$(fm_backend_hc_get "$1"); then rc=0; else rc=$?; fi
   if [ "$rc" -eq 3 ]; then printf 'missing'; return 0; fi
   [ "$rc" -eq 0 ] || { printf 'unreadable'; return 0; }
+  case "$(fm_backend_hc_snapshot_state "$1" "$expected" "$json")" in
+    foreign) printf 'unverified'; return 0 ;;
+    unreadable) printf 'unreadable'; return 0 ;;
+  esac
   fields=$(printf '%s' "$json" | jq -r '[.state // "", .foreground.name // "", .foreground.argv[0] // "",
     ((.foreground.argv // []) | join(" ")), (.foreground.pid // "" | tostring)] | @tsv' 2>/dev/null) || {
     printf 'unreadable'
@@ -479,24 +578,37 @@ EOF
   # of the same foreground process group, which is what tmux reads too. A shell
   # wrapper waiting on the harness is such a launcher, so a shell is only dead
   # once its group holds no harness.
-  fm_backend_hc_group_has_agent "$pid" && { printf 'alive'; return 0; }
+  rc=0
+  fm_backend_hc_group_has_agent "$pid" || rc=$?
+  [ "$rc" != 0 ] || { printf 'alive'; return 0; }
+  [ "$rc" != 2 ] || { printf 'unreadable'; return 0; }
   [ "$class" != shell ] || { printf 'dead'; return 0; }
   printf 'ambiguous'
 }
 
 # fm_backend_hc_group_has_agent: whether any other process in <pid>'s process
-# group classifies as a harness. Positive evidence only.
+# group classifies as a harness. Returns 0 for a harness, 1 for a complete
+# shell-only group, and 2 for incomplete or unclassified evidence.
 fm_backend_hc_group_has_agent() {  # <pid>
-  local pid=$1 pgid member mpgid comm args
-  case "$pid" in ''|*[!0123456789]*) return 1 ;; esac
-  pgid=$(LC_ALL=C ps -o pgid= -p "$pid" 2>/dev/null | tr -d ' ') || return 1
-  [ -n "$pgid" ] || return 1
+  local pid=$1 pgid member mpgid comm args table class uncertain=0 seen=0
+  case "$pid" in ''|*[!0123456789]*) return 2 ;; esac
+  pgid=$(LC_ALL=C ps -o pgid= -p "$pid" 2>/dev/null | tr -d ' ') || return 2
+  [ -n "$pgid" ] || return 2
+  table=$(LC_ALL=C ps -A -o pid=,pgid=,comm= 2>/dev/null) || return 2
+  [ -n "$table" ] || return 2
   while read -r member mpgid comm; do
-    [ "$mpgid" = "$pgid" ] && [ "$member" != "$pid" ] || continue
-    args=$(LC_ALL=C ps -o args= -p "$member" 2>/dev/null) || continue
-    [ "$(fm_agent_process_classify "$comm" "${args%% *}" "$args" "$member")" = agent ] && return 0
+    [ "$mpgid" = "$pgid" ] || continue
+    [ "$member" != "$pid" ] || { seen=1; continue; }
+    if ! args=$(LC_ALL=C ps -o args= -p "$member" 2>/dev/null) || [ -z "$args" ]; then
+      uncertain=1
+      continue
+    fi
+    class=$(fm_agent_process_classify "$comm" "${args%% *}" "$args" "$member")
+    [ "$class" != agent ] || return 0
+    [ "$class" = shell ] || uncertain=1
   done <<EOF
-$(LC_ALL=C ps -A -o pid=,pgid=,comm= 2>/dev/null)
+$table
 EOF
+  [ "$seen" = 1 ] && [ "$uncertain" = 0 ] || return 2
   return 1
 }

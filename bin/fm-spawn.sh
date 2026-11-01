@@ -131,7 +131,7 @@
 #   (the paseo, tern, and hc markers leak into every descendant process).
 #   codex-app is not a known backend yet; docs/codex-app-backend.md owns that
 #   blocked backend contract. Default tmux spawns do not write backend= to meta;
-#   absent backend= means tmux. Orca, cmux, paseo, tern, and hc do not support
+#   absent backend= means tmux. Orca, cmux, paseo, and tern do not support
 #   --secondmate spawns.
 #   A rex crewmate or scout opens one tab in the Rex session the launching
 #   firstmate runs in when it runs directly inside Rex, otherwise in its home's
@@ -1581,6 +1581,7 @@ HERDR_PRESENTATION_ORDER_LOCK=
 HERDR_PRESENTATION_ORDER_LOCK_HELD=0
 SPAWN_TASK_LOCK=
 SPAWN_TASK_LOCK_HELD=0
+HC_SECONDMATE_LAUNCH_LOCK=
 SPAWN_CONTROL_LOCK=
 SPAWN_CONTROL_LOCK_HELD=0
 SPAWN_CONTROL_PARENT=0
@@ -1786,6 +1787,7 @@ spawn_abort_cleanup() {
         || echo "warning: could not return the leased worktree $WT for $ID; run 'treehouse return --force $WT' from $PROJ_ABS" >&2
     fi
   fi
+  [ -z "$HC_SECONDMATE_LAUNCH_LOCK" ] || fm_lock_release "$HC_SECONDMATE_LAUNCH_LOCK" || true
   if [ "$SPAWN_TASK_LOCK_HELD" = 1 ]; then
     SPAWN_TASK_LOCK_HELD=0
     fm_lock_release "$SPAWN_TASK_LOCK" || true
@@ -2231,11 +2233,30 @@ fi
 if [ "$RELAUNCH" -eq 0 ]; then
   if [ "$BACKEND_SET" -eq 1 ]; then
     BACKEND=$BACKEND_ARG
+  elif [ "$KIND" = secondmate ] && [ "$(fm_meta_get "$STATE/$ID.meta" backend)" = hc ]; then
+    fm_backend_validate_task_endpoint "$STATE/$ID.meta" "$ID" || exit 1
+    BACKEND=hc
   else
     BACKEND=$(fm_backend_name)
   fi
+  if [ "$BACKEND" = hc ] && [ "$KIND" = secondmate ] && [ -e "$STATE/$ID.meta" ]; then
+    fm_backend_validate_task_endpoint "$STATE/$ID.meta" "$ID" || exit 1
+    [ "$FM_BACKEND_VALIDATED_BACKEND" = hc ] || {
+      echo "error: preserve the previous endpoint record outside state/$ID.meta before an approved backend migration" >&2
+      exit 1
+    }
+    HC_SESSION=$(fm_meta_get "$STATE/$ID.meta" hc_session)
+    export HC_SESSION
+  fi
   fm_backend_validate_spawn "$BACKEND" || exit 1
   fm_backend_source "$BACKEND" || exit 1
+  if [ "$BACKEND" = hc ] && [ "$KIND" = secondmate ]; then
+    fm_backend_hc_secondmate_runtime_check || exit 1
+    if [ -e "$STATE/$ID.meta" ] && ! fm_backend_hc_record_matches_core "$STATE/$ID.meta"; then
+      echo "error: recorded hc core identity missing or changed; preserving secondmate" >&2
+      exit 1
+    fi
+  fi
   if [ "$BACKEND" = orca ] && [ "$KIND" = secondmate ]; then
     echo "error: backend=orca does not support --secondmate spawns yet" >&2
     exit 1
@@ -2250,10 +2271,6 @@ if [ "$RELAUNCH" -eq 0 ]; then
   fi
   if [ "$BACKEND" = tern ] && [ "$KIND" = secondmate ]; then
     echo "error: backend=tern does not support --secondmate spawns yet" >&2
-    exit 1
-  fi
-  if [ "$BACKEND" = hc ] && [ "$KIND" = secondmate ]; then
-    echo "error: backend=hc does not support --secondmate spawns yet" >&2
     exit 1
   fi
   fm_backend_runtime_check "$BACKEND" || exit 1
@@ -2331,6 +2348,9 @@ if [ "$RELAUNCH" -eq 1 ]; then
   RELAUNCH_TARGET=$FM_BACKEND_VALIDATED_TARGET
   fm_backend_validate_spawn "$BACKEND" || exit 1
   fm_backend_source "$BACKEND" || exit 1
+  if [ "$BACKEND" = hc ]; then
+    fm_backend_hc_record_matches_core "$RELAUNCH_META" || { echo "error: relaunch cannot verify the recorded hc core" >&2; exit 1; }
+  fi
   # A relaunch must PROVE the previous agent is gone before it launches another
   # one into the same endpoint, and only a backend with a recovery-grade
   # classifier can (bin/fm-control-lib.sh owns that capability table).
@@ -2357,7 +2377,7 @@ if [ "$RELAUNCH" -eq 1 ]; then
   # endpoint was DESTROYED" with "the endpoint is UNREACHABLE from here right
   # now", and an unreachable endpoint can still hold the live agent this
   # relaunch would duplicate. So absence is PROVEN before it may rebind, never
-  # inferred from a failed read - and only HERDR and REX can prove it:
+  # inferred from a failed read - supported proofs are:
   #   herdr - the recorded session's server is started, and the recorded pane is
   #           RE-READ through that session's own socket. `dead` means the pane
   #           survived the restart and is adopted after all; `alive` means the
@@ -2369,6 +2389,8 @@ if [ "$RELAUNCH" -eq 1 ]; then
   #           `unreadable` is rechecked too, because a stopped Rex server
   #           reads as unreachable to a read that never starts it
   #           (fm_control_absence_recheck_applies owns that rule).
+  #   hc    - the permanent core identity must still match the record before
+  #           its structured not-found can authorize replacement.
   #   tmux  - REFUSES, always. A task record carries no socket identity for its
   #           endpoint, and a server-wide inventory describes only the server
   #           this process addresses, so no read available here can tell "gone"
@@ -2380,7 +2402,7 @@ if [ "$RELAUNCH" -eq 1 ]; then
   # owns that vocabulary). The proof itself lives in one place for the whole
   # control plane - fm_control_endpoint_absence_verdict - so `exit` and
   # `relaunch` cannot reach two different answers about one endpoint.
-  RELAUNCH_STATE=$(fm_backend_agent_state "$BACKEND" "$RELAUNCH_TARGET")
+  RELAUNCH_STATE=$(fm_backend_agent_state "$BACKEND" "$RELAUNCH_TARGET" "fm-$ID")
   if fm_control_absence_recheck_applies "$BACKEND" "$RELAUNCH_STATE"; then
     RELAUNCH_ABSENCE=$(fm_control_endpoint_absence_verdict "$BACKEND" "$RELAUNCH_TARGET" "$RELAUNCH_META")
     case "${RELAUNCH_ABSENCE%%$'\t'*}" in
@@ -2451,6 +2473,11 @@ if [ "$RELAUNCH" -eq 1 ]; then
     HERDR_WORKSPACE_ID=$(fm_meta_get "$RELAUNCH_META" herdr_workspace_id)
     HERDR_TAB_ID=$(fm_meta_get "$RELAUNCH_META" herdr_tab_id)
     HERDR_PANE_ID=$(fm_meta_get "$RELAUNCH_META" herdr_pane_id)
+  fi
+  if [ "$BACKEND" = hc ]; then
+    HC_SES=$(fm_meta_get "$RELAUNCH_META" hc_session)
+    HC_TERMINAL=$(fm_meta_get "$RELAUNCH_META" hc_terminal)
+    HC_CORE_ID=$(fm_meta_get "$RELAUNCH_META" hc_core_id)
   fi
   if [ "$BACKEND" = rex ]; then
     FM_REX_TASK_SESSION_ID=$(fm_meta_get "$RELAUNCH_META" rex_session_id)
@@ -2766,10 +2793,12 @@ launch_template() {
   # (docs/turnend-guard.md, docs/sessionstart-nudge.md, docs/cd-guard.md), so the
   # secondmate launch deliberately keeps hooks on but shares this approval posture.
   codex)
+    printf '%s' 'codex '
+    [ "${BACKEND:-}" != hc ] || printf '%s' '--no-daemon '
     if [ "$kind" = secondmate ]; then
-      printf '%s' 'codex __MODELFLAG____EFFORTFLAG____CODEXAPPROVALFLAG__ "$(__OPINPUT__ encode launch-brief < __BRIEF__)"'
+      printf '%s' '__MODELFLAG____EFFORTFLAG____CODEXAPPROVALFLAG__ "$(__OPINPUT__ encode launch-brief < __BRIEF__)"'
     else
-      printf '%s' 'codex __MODELFLAG____EFFORTFLAG____CODEXAPPROVALFLAG__ --disable hooks -c "notify=[\"bash\",\"-c\",\"touch __TURNEND__\"]" "$(__OPINPUT__ encode launch-brief < __BRIEF__)"'
+      printf '%s' '__MODELFLAG____EFFORTFLAG____CODEXAPPROVALFLAG__ --disable hooks -c "notify=[\"bash\",\"-c\",\"touch __TURNEND__\"]" "$(__OPINPUT__ encode launch-brief < __BRIEF__)"'
     fi
     ;;
   opencode) printf '%s' 'OPENCODE_CONFIG_CONTENT='\''{"permission":{"*":"allow"}__EFFORTFLAG__}'\'' __OPENCODEBIN__ __MODELFLAG__--prompt "$(__OPINPUT__ encode launch-brief < __BRIEF__)"' ;;
@@ -3055,6 +3084,11 @@ case "$ARG3" in
   }
   ;;
 esac
+
+if [ "$BACKEND" = hc ] && [[ "$HARNESS" = codex* ]]; then
+  [ "$RAW_LAUNCH" = 0 ] || { echo "error: hc Codex requires the managed --no-daemon launch template" >&2; exit 1; }
+  fm_backend_hc_codex_launch_check || exit 1
+fi
 
 # muse, gemini, devin, commandcode, polytoken, cortex, and kiro are verified as CREWMATE/SCOUT adapters only. A secondmate is
 # a firstmate instance, so it needs a primary supervision protocol.
@@ -3911,6 +3945,25 @@ if [ "$KIND" = secondmate ]; then
     SECONDMATE_PROJECTS=$SECONDMATE_REGISTRY_MATCH_PROJECTS
   fi
   WT="$PROJ_ABS"
+  if [ "$BACKEND" = hc ]; then
+    # Hold the child's launch gate through publication. Its session lock is
+    # acquired by its own harness, never by this parent process.
+    # shellcheck source=bin/fm-hc-secondmate-lib.sh
+    . "$SCRIPT_DIR/fm-hc-secondmate-lib.sh"
+    fm_hc_secondmate_parent_matches "$PROJ_ABS" "$FM_HOME" || exit 1
+    mkdir -p "$PROJ_ABS/state" || exit 1
+    hc_launch_lock="$PROJ_ABS/state/.hc-secondmate-launch.lock"
+    fm_lock_try_acquire "$hc_launch_lock" || { echo "error: secondmate home launch already in progress" >&2; exit 1; }
+    HC_SECONDMATE_LAUNCH_LOCK=$hc_launch_lock
+    fm_hc_secondmate_require_unlocked "$PROJ_ABS" || exit 1
+    if [ "$RELAUNCH" = 0 ] && [ -e "$STATE/$ID.meta" ]; then
+      old_hc_target=$(fm_backend_target_of_meta "$STATE/$ID.meta")
+      case "$(fm_backend_hc_agent_state "$old_hc_target" "fm-$ID")" in
+        missing) fm_backend_hc_kill "$old_hc_target" '' "fm-$ID" || exit 1 ;;
+        *) echo "error: existing hc endpoint must be proven absent before fresh secondmate spawn; use fm-control relaunch for a retained shell" >&2; exit 1 ;;
+      esac
+    fi
+  fi
   # Local-HEAD sync: before launch, fast-forward this secondmate's worktree to the
   # PRIMARY checkout's current default-branch commit, so a freshly spawned or
   # recovery-respawned secondmate always runs the primary's version (AGENTS.md
@@ -4682,6 +4735,12 @@ if [ "$RELAUNCH" -eq 1 ]; then
     T=$RELAUNCH_TARGET
     WT_TARGET=$T
     SES=${T%%:*}
+  elif [ "$BACKEND" = hc ]; then
+    fm_backend_hc_kill "$RELAUNCH_TARGET" '' "$W" || exit 1
+    HC_TERMINAL=$(fm_backend_hc_create_task "$HC_SES" "$W" "$WT") || exit 1
+    T="$HC_SES:$HC_TERMINAL"
+    WT_TARGET=$T
+    SES=$HC_SES
   elif [ "$BACKEND" = rex ]; then
     # The recorded endpoint is authoritatively gone, so there is nothing to
     # adopt: create ONE fresh endpoint for the same task, opened directly in the
@@ -5076,6 +5135,7 @@ EOF
     ;;
   hc)
     HC_SES=$(fm_backend_hc_container_ensure) || exit 1
+    HC_CORE_ID=$(fm_backend_hc_core_id "$HC_SES") || { echo "error: cannot bind hc core identity" >&2; exit 1; }
     HC_TERMINAL=$(fm_backend_hc_create_task "$HC_SES" "$W" "$PROJ_ABS") || exit 1
     T="$HC_SES:$HC_TERMINAL"
     ;;
@@ -6970,7 +7030,7 @@ SPAWN_META_PATH=$SPAWN_META_TMP
 preserve_relaunch_meta() {
   awk -F= '
     BEGIN {
-      split("window endpoint_task_id worktree project harness kind mode yolo branch tasktmp base_branch upstream_consent forge backup_remote backup_prefix model effort opencode_version account account_provider omp_profile busy_gen spawn_gen approval_mode traceparent backend herdr_session herdr_workspace_id herdr_tab_id herdr_pane_id zellij_session zellij_tab_id zellij_pane_id orca_worktree_id terminal cmux_workspace_id cmux_surface_id paseo_terminal_id paseo_workspace_id rex_server rex_session_id rex_window_id rex_block_id t3_thread_id t3_project_id tern_session_id tern_tab_id tern_block_id hc_session hc_terminal home projects control_relaunch_tx polytoken_session polytoken_port polytoken_credential", keys, " ")
+      split("window endpoint_task_id worktree project harness kind mode yolo branch tasktmp base_branch upstream_consent forge backup_remote backup_prefix model effort opencode_version account account_provider omp_profile busy_gen spawn_gen approval_mode traceparent backend herdr_session herdr_workspace_id herdr_tab_id herdr_pane_id zellij_session zellij_tab_id zellij_pane_id orca_worktree_id terminal cmux_workspace_id cmux_surface_id paseo_terminal_id paseo_workspace_id rex_server rex_session_id rex_window_id rex_block_id t3_thread_id t3_project_id tern_session_id tern_tab_id tern_block_id hc_session hc_terminal hc_core_id home projects control_relaunch_tx polytoken_session polytoken_port polytoken_credential", keys, " ")
       for (i in keys) owned[keys[i]] = 1
     }
     !($1 in owned)
@@ -7060,6 +7120,7 @@ preserve_relaunch_meta() {
   if [ "$BACKEND" = hc ]; then
     echo "hc_session=$HC_SES"
     echo "hc_terminal=$HC_TERMINAL"
+    echo "hc_core_id=$HC_CORE_ID"
   fi
   if [ "$KIND" = secondmate ]; then
     echo "home=$PROJ_ABS"
@@ -7354,6 +7415,10 @@ if [ "$KIND" = secondmate ]; then
   # Reuse the single frozen decision from the carrier resolution above so the
   # injected carrier and this on/off snapshot are guaranteed to agree.
   LAUNCH="FM_ROOT_OVERRIDE= FM_STATE_OVERRIDE= FM_DATA_OVERRIDE= FM_PROJECTS_OVERRIDE= FM_CONFIG_OVERRIDE= FM_PUBLIC_FOLLOWUP_PRIMARY_HOME=$sq_primary_home FM_HOME=$sq_home FM_TRACE_CONTEXT=$SPAWN_TRACE_EFFECTIVE FM_SUPERVISION_MODEL=$supervision_model $LAUNCH"
+fi
+if [ "$KIND" = secondmate ] && [ "$BACKEND" = hc ]; then
+  fm_hc_secondmate_bind "$PROJ_ABS" "$ID" "$T" || exit 1
+  LAUNCH="FM_SUPERVISOR_BACKEND=hc FM_SUPERVISOR_TARGET=$(shell_quote "$T") $LAUNCH"
 fi
 # Implement the launch-delivery contract in this script's header. The full
 # home-identity hash isolates equal task ids across homes, and the spawn token in
@@ -7860,6 +7925,9 @@ SPAWN_ACCOUNT=
 [ -z "$WORKER_ACCOUNT_PROVIDER" ] || SPAWN_ACCOUNT="$SPAWN_ACCOUNT account_provider=$WORKER_ACCOUNT_PROVIDER"
 [ -z "$OMP_PROFILE_PIN" ] || SPAWN_ACCOUNT="$SPAWN_ACCOUNT omp_profile=$OMP_PROFILE_PIN"
 # Opt-in fleet activity ledger (docs/fleet-ledger.md); off costs one file test.
+if [ "$KIND" = secondmate ] && [ "$BACKEND" = hc ]; then
+  fm_hc_secondmate_wait_ready "$PROJ_ABS" "$T" "$W" || exit 1
+fi
 [ ! -e "$CONFIG/fleet-ledger" ] || [ "$RELAUNCH" -eq 1 ] || FM_HOME=$FM_HOME FM_STATE_OVERRIDE=$STATE FM_CONFIG_OVERRIDE=$CONFIG "$SCRIPT_DIR/fm-fleet-ledger.sh" dispatched "$ID" "$KIND" "${PROJ_ABS##*/}" "$HARNESS" "$MODEL" || true
 # Opt-in Herdr project groups (docs/herdr-backend.md "Project groups") tag the
 # new endpoint now rather than at the next watcher poll; off costs one file test.

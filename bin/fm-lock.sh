@@ -82,6 +82,14 @@ me=$(fm_session_lock_anchor_pid) || {
   fi
   exit 1
 }
+if [ -e "$STATE/.hc-secondmate.json" ] || [ -L "$STATE/.hc-secondmate.json" ]; then
+  # shellcheck source=bin/fm-hc-secondmate-lib.sh
+  . "$SCRIPT_DIR/fm-hc-secondmate-lib.sh"
+  fm_hc_secondmate_lock_owner "$FM_HOME" "$me" || {
+    echo "error: harness pid $me does not belong to this home's native hc endpoint; operate read-only until resolved" >&2
+    exit 1
+  }
+fi
 probe=$(mktemp "$STATE/.lock-write.XXXXXX" 2>/dev/null) || {
   echo "error: cannot write session lock; operate read-only until resolved" >&2
   exit 1

@@ -222,7 +222,18 @@ fm_secondmate_liveness_probe() {  # <meta> <id> <full|poll>
   backend=$(fm_backend_of_meta "$meta")
   target=$(fm_backend_target_of_meta "$meta")
   [ -n "$target" ] || target="$window"
-  agent_state=$(fm_backend_agent_state "$backend" "$target" 2>/dev/null) || agent_state=unreadable
+  if [ "$backend" = hc ] && ! fm_backend_validate_task_endpoint "$meta" "$id" >/dev/null 2>&1; then
+    FM_SM_LIVE_REASON="malformed hc endpoint metadata; preserving secondmate"
+    return 0
+  fi
+  if [ "$backend" = hc ]; then
+    fm_backend_source hc || return 0
+    if ! fm_backend_hc_record_matches_core "$meta"; then
+      FM_SM_LIVE_REASON="hc core identity missing or changed; preserving secondmate"
+      return 0
+    fi
+  fi
+  agent_state=$(fm_backend_agent_state "$backend" "$target" "fm-$id" 2>/dev/null) || agent_state=unreadable
   case "$harness" in
     claude|codex|opencode|pi|pi-signed|grok|kimi|omp) ;;
     *)
@@ -247,7 +258,7 @@ fm_secondmate_liveness_probe() {  # <meta> <id> <full|poll>
         # A T3 thread reads missing once archived, which T3 may still be
         # finishing; its idempotent kill re-proves the close before a
         # replacement thread is launched.
-        [ "$backend" != t3code ] || FM_SM_LIVE_KILL=1
+        case "$backend" in t3code|hc) FM_SM_LIVE_KILL=1 ;; esac
         FM_SM_LIVE_CAUSE="recorded endpoint confidently missing"
       fi
       FM_SM_LIVE_WHERE="backend=$backend"
@@ -320,7 +331,31 @@ fm_secondmate_liveness_relaunch() {  # <meta> <id> [timeout-secs]
       window=$(fm_meta_get "$meta" window)
       target=$window
     fi
-    if [ "$backend" != t3code ]; then
+    if [ "$backend" = hc ]; then
+      # A probe is not permission to kill an agent that appeared since it.
+      local current_hc_state hc_home hc_gate hc_gate_held=0
+      # shellcheck source=bin/fm-hc-secondmate-lib.sh
+      . "$FM_SM_LIVE_LIB_DIR/fm-hc-secondmate-lib.sh"
+      hc_home=$(fm_meta_get "$meta" worktree)
+      hc_gate="$hc_home/state/.hc-secondmate-launch.lock"
+      fm_lock_try_acquire "$hc_gate" && hc_gate_held=1
+      current_hc_state=$(fm_backend_agent_state hc "$target" "fm-$id")
+      if [ "$hc_gate_held" != 1 ] \
+        || ! fm_backend_validate_task_endpoint "$meta" "$id" >/dev/null 2>&1 \
+        || ! fm_backend_hc_record_matches_core "$meta" \
+        || ! fm_hc_secondmate_require_unlocked "$hc_home" \
+        || { [ "$current_hc_state" != dead ] && [ "$current_hc_state" != missing ]; } \
+        || ! fm_backend_kill hc "$target" '' "fm-$id"; then
+        [ "$hc_gate_held" != 1 ] || fm_lock_release "$hc_gate" || true
+        fm_secondmate_liveness_ledger_add "$id" failed || true
+        fm_lock_release "$relaunch_lock" || true
+        FM_SM_LIVE_STATUS=skipped
+        FM_SM_LIVE_REASON="could not prove the old hc endpoint closed; preserving its record"
+        FM_SM_LIVE_RC=1
+        return 1
+      fi
+      fm_lock_release "$hc_gate" || return 1
+    elif [ "$backend" != t3code ]; then
       if [ -n "$target" ]; then
         if [ "$backend" = rex ]; then
           local home

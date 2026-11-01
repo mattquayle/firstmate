@@ -540,7 +540,7 @@ fm_backend_worktree_identity_repair_hint() {  # <meta-file>
 
 fm_backend_validate_task_endpoint() {  # <meta-file> <task-id>
   local meta=$1 id=$2 backend_count backend window worktree project binding_count binding
-  local session pane recorded_session workspace tab terminal worktree_id surface rex_window rex_server thread block
+  local session pane recorded_session workspace tab terminal worktree_id surface rex_window rex_server thread block core
   FM_BACKEND_VALIDATED_BACKEND=
   FM_BACKEND_VALIDATED_TARGET=
   [ -f "$meta" ] && [ ! -L "$meta" ] || {
@@ -755,12 +755,19 @@ fm_backend_validate_task_endpoint() {  # <meta-file> <task-id>
       }
       recorded_session=$(fm_backend_meta_exact_value "$meta" hc_session) || recorded_session=
       terminal=$(fm_backend_meta_exact_value "$meta" hc_terminal) || terminal=
+      core=$(fm_backend_meta_exact_value "$meta" hc_core_id) || core=
       if [ -z "$recorded_session" ] || [ -z "$terminal" ] \
         || [ "$window" != "$recorded_session:$terminal" ] \
         || ! fm_backend_endpoint_atom_valid "$recorded_session" \
-        || ! fm_backend_endpoint_atom_valid "$terminal"; then
+        || ! [[ "$terminal" =~ ^t[0-9a-z]+$ ]]; then
         echo "REFUSED: hc endpoint metadata for task $id is malformed or inconsistent; preserving task state." >&2
         return 1
+      fi
+      if grep -q '^hc_core_id=' "$meta" || [ "$(fm_backend_meta_exact_value "$meta" kind)" = secondmate ]; then
+        if ! [[ "$core" =~ ^[A-Za-z0-9_-]+$ ]]; then
+          echo "REFUSED: hc endpoint metadata lacks one valid permanent core identity; preserving task state." >&2
+          return 1
+        fi
       fi
       ;;
   esac
@@ -1383,7 +1390,7 @@ fm_backend_agent_state() {  # <backend> <target>
     rex) fm_backend_rex_agent_state "$target" ;;
     t3code) fm_backend_t3code_agent_state "$target" ;;
     tern) fm_backend_tern_agent_state "$target" ;;
-    hc) fm_backend_hc_agent_state "$target" ;;
+    hc) fm_backend_hc_agent_state "$target" "${3:-}" ;;
     *) printf 'unverified' ;;
   esac
 }

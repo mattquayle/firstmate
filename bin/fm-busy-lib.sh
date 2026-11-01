@@ -56,7 +56,7 @@
 #                    unknown invalidation fm-control writes after a Devin interrupt
 #   fm-recovery      a documented recovery reset after relaunch
 # Classifier-only sources (never written into a record):
-#   endpoint-gone, herdr-native, rex-native, t3code-native, tern-native, grok-regex, rovo-regex, agy-regex, muse-session-log,
+#   endpoint-gone, herdr-native, rex-native, t3code-native, tern-native, hc-native, grok-regex, rovo-regex, agy-regex, muse-session-log,
 #   cursor-transcript, missing, malformed, gen-mismatch, source-mismatch,
 #   kimi-unverified, codex-unverified, capture-failed, no-target, launch-prompt
 #
@@ -65,7 +65,8 @@
 #   1. dead endpoint (fm_busy_classify_live only) -> dead endpoint-gone
 #   2. a t3code task: the T3 server's busy, idle, or unknown verdict
 #      (the provider reports it for claude and codex alike, and no
-#      shell sits in front of the agent)
+#      shell sits in front of the agent); hc uses its owned terminal
+#      program's OSC 7501 status, with missing status remaining unknown
 #   3. standalone Kimi before verification       -> unknown kimi-unverified
 #   4. a valid, gen-matching, source-trusted record -> its state and source,
 #      UNLESS the record is still the untouched seed fm-spawn wrote at arm
@@ -1126,6 +1127,15 @@ fm_busy_launch_prompt_parked() {  # <harness>
 fm_busy_classify() {  # <backend> <target> <harness> <id> <state-dir> [tail40]
   local backend=$1 target=$2 harness=$3 id=$4 state=$5 tail40=${6-}
   local out rc r_state r_source native log
+  # hc reports OSC 7501 lifecycle status for the current terminal program,
+  # including Codex. Missing or foreign status remains unknown; it must not
+  # fall through to a prior incarnation's hook record.
+  if [ "$backend" = hc ] && command -v fm_backend_busy_state >/dev/null 2>&1; then
+    native=$(fm_backend_busy_state hc "$target" "fm-$id" 2>/dev/null || true)
+    case "$native" in busy|idle) ;; *) native=unknown ;; esac
+    printf '%s hc-native' "$native"
+    return 0
+  fi
   # t3code first: the T3 server reports the session status for claude and
   # codex alike. Native uncertainty must not fall through to a stale idle
   # record or a harness-specific fallback.

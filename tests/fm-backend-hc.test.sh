@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# shellcheck disable=SC2016 # Scripts passed to child shells expand their own variables.
 # tests/fm-backend-hc.test.sh - fake-hc-CLI unit tests for the herdr-core
 # session-provider adapter (bin/backends/hc.sh) and its dispatcher arms in
 # bin/fm-backend.sh. tests/fm-backend-hc-smoke.test.sh drives a real isolated
@@ -35,7 +36,7 @@ case "$cmd" in
   server) printf '{"live":0}\n' ;;
   connect)
     IFS= read -r _req || true
-    printf '{"jsonrpc":"2.0","id":1,"result":{"generation":%s}}\n' "${FAKE_HC_GENERATION:-1}"
+    printf '{"jsonrpc":"2.0","id":1,"result":{"generation":%s,"core":{"id":"%s"}}}\n' "${FAKE_HC_GENERATION:-1}" "${FAKE_HC_CORE_ID:-core-test}"
     ;;
   ls) cat "$D/ls.json" 2>/dev/null || printf '{"terminals":[]}\n' ;;
   run) cat "$D/run.json" ;;
@@ -194,10 +195,16 @@ test_agent_state_classifies_foreground_and_absence() {
   write_terminal "$D" t3 finished fm-a1 "$tag" "" ""
   write_terminal "$D" t4 live fm-a1 "$tag" node node
   write_terminal "$D" t5 live fm-a1 "$tag" "" ""
+  # Never borrow PID 1's actual group: it differs under a PID namespace and
+  # cannot prove either synthetic foreground stopped. Real groups have their
+  # own cases below and in the live smoke.
+  for addr in t2 t4; do
+    jq '.foreground.pid=2147483647' "$D/$addr.json" > "$D/tmp" && mv "$D/tmp" "$D/$addr.json"
+  done
   printf '1\n' > "$D/t6.exit"
   # shellcheck disable=SC2016 # the inner shell expands it
   out=$(hc_shell 'for a in t1 t2 t3 t4 t5 t6 t7; do printf "%s=%s " $a "$(fm_backend_agent_state hc fmtest:$a)"; done')
-  assert_equals "$out" "t1=alive t2=dead t3=missing t4=ambiguous t5=unreadable t6=unreadable t7=missing " \
+  assert_equals "$out" "t1=alive t2=unreadable t3=missing t4=unreadable t5=unreadable t6=unreadable t7=missing " \
     "agent_state over claude, shell, finished, other, no foreground, core error, not found"
   pass "hc: agent_state maps foreground, finished, not_found and core errors onto the shared vocabulary"
 }
@@ -357,7 +364,109 @@ test_required_tool_check_uses_the_adapter_resolver() {
   pass "hc: the bootstrap tool check resolves hc exactly as the adapter does"
 }
 
+test_secondmate_recovery_refuses_foreign_and_malformed_endpoints() {
+  local tag out
+  setup_case recovery
+  tag=$(hometag_of)
+  mkdir -p "$HOMEDIR/state"
+  printf 'window=fmtest:t1\nendpoint_task_id=a1\nkind=secondmate\nharness=codex\nworktree=/wt\nproject=/p\nbackend=hc\nhc_session=fmtest\nhc_terminal=t1\nhc_core_id=core-test\n' > "$HOMEDIR/state/a1.meta"
+  write_terminal "$D" t1 finished fm-other "$tag" '' ''
+  out=$(hc_shell '. "'"$FM_TEST_ROOT"'/bin/fm-secondmate-liveness-lib.sh"
+    fm_secondmate_liveness_probe "$FM_HOME/state/a1.meta" a1 poll
+    printf "%s %s" "$FM_SM_LIVE_STATUS" "$FM_SM_LIVE_STATE"')
+  assert_equals "$out" 'skipped unverified' 'foreign finished endpoint cannot authorize recovery'
+  write_terminal "$D" t1 live fm-a1 "$tag" codex codex
+  expect_refused env FAKE_HC_CORE_ID=foreign-core FAKE_HC_DIR="$D" PATH="$FB:$PATH" \
+    FM_HC_BIN="$FB/hc" FM_HOME="$HOMEDIR" FM_ROOT_OVERRIDE="$HOMEDIR" \
+    bash -c '. "$1/bin/fm-backend.sh"; fm_backend_send_text_line hc fmtest:t1 unsafe fm-a1' _ "$FM_TEST_ROOT"
+  assert_no_grep 'unsafe' "$D/log" 'a reused endpoint on a foreign core receives no text'
+  write_terminal "$D" t1 finished fm-a1 "$tag" '' ''
+  printf 'hc_terminal=t2\n' >> "$HOMEDIR/state/a1.meta"
+  : > "$D/log"
+  out=$(hc_shell '. "'"$FM_TEST_ROOT"'/bin/fm-secondmate-liveness-lib.sh"
+    fm_secondmate_liveness_probe "$FM_HOME/state/a1.meta" a1 poll
+    printf "%s" "$FM_SM_LIVE_STATUS"')
+  assert_equals "$out" skipped 'duplicate endpoint field cannot authorize recovery'
+  assert_equals "$(cat "$D/log")" '' 'malformed record never reaches a core'
+  pass 'hc secondmate recovery refuses foreign finished endpoints and malformed records'
+}
+
+test_hc_absence_requires_owned_or_structurally_missing_endpoint() {
+  local tag out
+  setup_case absence
+  mkdir -p "$HOMEDIR/state"
+  printf 'window=fmtest:t1\nendpoint_task_id=a1\nkind=secondmate\nharness=codex\nworktree=/wt\nproject=/p\nbackend=hc\nhc_session=fmtest\nhc_terminal=t1\nhc_core_id=core-test\n' > "$HOMEDIR/state/a1.meta"
+  tag=$(hometag_of)
+  write_terminal "$D" t1 finished fm-other "$tag" '' ''
+  out=$(hc_shell '. "'"$FM_TEST_ROOT"'/bin/fm-control-lib.sh"
+    fm_control_endpoint_absence_verdict hc fmtest:t1 "$FM_HOME/state/a1.meta"')
+  assert_contains "$out" unproven 'foreign terminal is not a proved stop'
+  write_terminal "$D" t1 finished fm-a1 "$tag" '' ''
+  out=$(hc_shell '. "'"$FM_TEST_ROOT"'/bin/fm-control-lib.sh"
+    fm_control_endpoint_absence_verdict hc fmtest:t1 "$FM_HOME/state/a1.meta"')
+  assert_equals "$out" $'gone\t' 'owned finished terminal cannot retain a running agent'
+  printf '1\n' > "$D/t1.exit"
+  out=$(hc_shell '. "'"$FM_TEST_ROOT"'/bin/fm-control-lib.sh"
+    fm_control_endpoint_absence_verdict hc fmtest:t1 "$FM_HOME/state/a1.meta"')
+  assert_contains "$out" unproven 'unreachable core cannot authorize replacement'
+  rm "$D/t1.exit" "$D/t1.json"
+  out=$(FAKE_HC_CORE_ID=foreign-core hc_shell '. "'"$FM_TEST_ROOT"'/bin/fm-control-lib.sh"
+    fm_control_endpoint_absence_verdict hc fmtest:t1 "$FM_HOME/state/a1.meta"')
+  assert_contains "$out" unproven 'same session name on another core cannot prove absence'
+  printf 'hc_core_id=second-id\n' >> "$HOMEDIR/state/a1.meta"
+  out=$(hc_shell '. "'"$FM_TEST_ROOT"'/bin/fm-control-lib.sh"
+    fm_control_endpoint_absence_verdict hc fmtest:t1 "$FM_HOME/state/a1.meta"')
+  assert_contains "$out" unproven 'duplicate core fields cannot prove absence'
+  pass 'hc lifecycle refuses foreign and unreachable endpoint absence claims'
+}
+
+test_hc_native_busy_and_home_scope() {
+  local tag out first second
+  setup_case busy-home
+  tag=$(hometag_of)
+  write_terminal "$D" t1 live fm-a1 "$tag" codex codex
+  jq '.status={state:"working"}' "$D/t1.json" > "$D/tmp" && mv "$D/tmp" "$D/t1.json"
+  out=$(hc_shell '. "'"$FM_TEST_ROOT"'/bin/fm-busy-lib.sh"; fm_busy_classify hc fmtest:t1 codex a1 "$FM_HOME/state"')
+  assert_equals "$out" 'busy hc-native' 'Codex native activity precedes its unknown hook source'
+  jq '.status=null' "$D/t1.json" > "$D/tmp" && mv "$D/tmp" "$D/t1.json"
+  out=$(hc_shell '. "'"$FM_TEST_ROOT"'/bin/fm-busy-lib.sh"; fm_busy_classify hc fmtest:t1 codex a1 "$FM_HOME/state"')
+  assert_equals "$out" 'unknown hc-native' 'absent native status is never idle'
+  mkdir -p "$HOMEDIR/other"
+  first=$(hc_shell 'fm_backend_hc_hometag')
+  second=$(hc_shell 'FM_HOME="$FM_HOME/other" fm_backend_hc_hometag')
+  [ "$first" != "$second" ] || fail 'two operational homes sharing code collide'
+  printf '{"terminals":null}\n' > "$D/ls.json"
+  expect_refused hc_shell 'fm_backend_hc_create_task fmtest fm-a1 /proj'
+  assert_not_contains "$(cat "$D/log")" $'\x1frun\x1f' 'malformed inventory must never create a duplicate'
+  pass 'hc native busy is explicit and operational homes remain distinct with shared code'
+}
+
+test_hc_incomplete_process_scan_refuses_dead() {
+  local tag out wrapper real_ps
+  setup_case process-read
+  tag=$(hometag_of)
+  real_ps=$(command -v ps)
+  set -m
+  bash -c 'sleep 30; :' &
+  wrapper=$!
+  set +m
+  write_terminal "$D" t1 live fm-a1 "$tag" bash bash
+  jq --argjson p "$wrapper" '.foreground.pid=$p' "$D/t1.json" > "$D/tmp" && mv "$D/tmp" "$D/t1.json"
+  # Inject a process-table read failure while retaining the real process tree.
+  printf '#!/usr/bin/env bash\n[ "$1" != -A ] || exit 1\nexec %q "$@"\n' "$real_ps" > "$FB/ps"
+  chmod +x "$FB/ps"
+  out=$(hc_shell 'fm_backend_agent_state hc fmtest:t1 fm-a1')
+  kill -- "-$wrapper" 2>/dev/null || true
+  wait "$wrapper" 2>/dev/null || true
+  assert_equals "$out" unreadable 'failed real process-group inventory is not dead'
+  pass 'hc refuses dead when process-group evidence is incomplete'
+}
+
 fm_test_run \
+  test_hc_native_busy_and_home_scope \
+  test_hc_incomplete_process_scan_refuses_dead \
+  test_secondmate_recovery_refuses_foreign_and_malformed_endpoints \
+  test_hc_absence_requires_owned_or_structurally_missing_endpoint \
   test_hc_is_spawn_capable_and_never_autodetected \
   test_required_tool_check_uses_the_adapter_resolver \
   test_create_task_is_independent_labeled_and_refuses_duplicates \

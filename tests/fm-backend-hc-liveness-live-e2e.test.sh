@@ -102,9 +102,14 @@ for harness in claude codex opencode pi grok kimi; do
   fi
   version=$("$bin_path" --version 2>/dev/null | head -1 | tr -d '\r') || version=
   [ -n "$version" ] || version=unknown
+  harness_args=()
+  if [ "$harness" = codex ]; then
+    fm_backend_hc_codex_launch_check || fail "Codex cannot keep execution in the lab terminal"
+    harness_args=(--no-daemon)
+  fi
   address=$(fm_backend_hc_cli "$HC_SESSION" run --bg --json --no-parent --outlive-parent --no-notify \
     --cwd "$HC_LAB_DIR/wt" --label "firstmate.task=fm-$harness" --label "firstmate.home=$(fm_backend_hometag)" \
-    "$bin_path" | jq -r '.address // empty')
+    "$bin_path" "${harness_args[@]}" | jq -r '.address // empty')
   fm_backend_hc_address_valid "$address" || fail "$harness ($version): hc did not start a terminal"
   target="$HC_SESSION:$address"
   state=

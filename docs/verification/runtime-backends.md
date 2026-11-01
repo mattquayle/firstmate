@@ -3577,9 +3577,37 @@ ok - hc liveness: grok grok 1.0.41 (4220f3b224a6) [stable] classifies alive in h
 
 Teardown swept the session's serve/hold daemons plus the harness processes they held, and the fleet-state tripwire confirmed the recorded real-core file metadata inventory unchanged.
 
+### Native persistent secondmates
+
+Measured on 2026-11-01 with hc 0.1.16 and Codex CLI 0.166.0 on Linux aarch64, using `gpt-6.1-sol` at low effort.
+`FM_HC_SECONDMATE_LIVE=1 bin/fm-test-run.sh tests/fm-hc-secondmate-live-e2e.test.sh` passed against a genuinely seeded scratch home with its stock primary hooks accepted through Codex's native trust UI.
+The managed launch used `--no-daemon`; the real tool process retained the terminal's own `HC_SESSION`, `HC_TERMINAL_ID`, and socket context, and its ancestry included the exact harness PID holding that home's lock.
+The parent configured future workers for Herdr while explicitly launching the mate on hc; ordinary configuration inheritance retained that worker choice, and recovery retained the mate's recorded hc session and permanent core identity despite conflicting ambient selection.
+
+```text
+ok - real Codex startup has native hc endpoint, own lock, app labels, and independent lifetime flags
+ok - real native secondmate handled durable inbox and resolved the parent request through its status channel
+ok - real pending input and mismatched core identity refuse lifecycle without stopping Codex
+ok - native home supervisor injection reaches its own real Codex through the guarded daemon primitive
+ok - graceful exit and relaunch retain same home, endpoint, backlog, uncommitted work, and independent child
+ok - recovery preserves recorded core and home, adopts app tab label, and converges without duplicates
+FM_TEST_COMPLETE
+```
+
+The supervisor check exercised the daemon's guarded injection primitive with a real agent acknowledgement, without starting a persistent daemon.
+The child remained a live independent endpoint across both relaunch and recovery; its metadata, the home's backlog, and an uncommitted file remained byte-identical.
+Native status supplied the busy/idle decision, and a read-only framed observation preserved Codex's styled placeholder distinction before typed exit.
+The observer rejects foreign labels, incomplete paints, concurrent updates, and disagreement with the complete plain read; it sends no terminal input, resize, focus, or facts updates.
+The portable behavioral suites are `tests/fm-backend-hc.test.sh`, `tests/fm-hc-screen.test.sh`, and `tests/fm-hc-secondmate-lock.test.sh`.
+They cover core identity and malformed metadata, ownership refusals, incomplete process evidence, pending input, and a safe reproduction of an unbound home's accepting a harness from another home.
+
+These live runs used the unchanged `fm-hc-lab.sh` helper inside an additional Linux mount/PID isolation boundary: production core paths were hidden and read-only, inherited sockets and host process access were excluded, and routing variables were scrubbed before provisioning.
+The original outside metadata equality check failed because active production metadata changed; that result was retained as a failure and was not treated as isolation proof.
+Only the separately verified kernel boundary and the helper's private-core checks under that boundary support these runs.
+
 ### Not verified
 
-- A ship spawn, and a spawn with a real harness rather than the stand-in.
-- `send --wait`'s `started`/`working` proof against a real status-reporting harness; the lab run covered a non-reporting shell, whose verdict falls to the composer screen.
-- Native `status.state` reported by a real harness launched through `bin/fm-spawn.sh`.
-- How the `herdr.space` and `herdr.tab` labels display in Herdr.app.
+- A ship spawn with a real harness; the credentialed lifecycle guard covers a secondmate.
+- Native secondmate lifecycle with harnesses other than Codex, and remote hc secondmates.
+- A persistent away-mode daemon's full long-running loop; its actual guarded injection primitive was exercised.
+- How the `herdr.space` and `herdr.tab` labels display in Herdr.app; label creation and reuse after recovery were verified through the core API.

@@ -361,7 +361,7 @@ fm_control_backend_supports_key() {  # <backend> <key>
 # unprovable transition as success.
 fm_control_backend_state_verified() {  # <backend>
   case "${1-}" in
-    tmux|herdr|rex|t3code) return 0 ;;
+    tmux|herdr|rex|t3code|hc) return 0 ;;
   esac
   return 1
 }
@@ -389,7 +389,7 @@ fm_control_backend_exit_supported() {  # <backend>
 # fm_control_backend_state_verified first.
 fm_control_backend_relaunch_supported() {  # <backend>
   case "${1-}" in
-    tmux|herdr|rex) return 0 ;;
+    tmux|herdr|rex|hc) return 0 ;;
   esac
   return 1
 }
@@ -486,6 +486,18 @@ fm_control_endpoint_absence_verdict() {  # <backend> <target> [meta]
         alive) printf 'alive\t' ;;
         missing) printf 'gone\t' ;;
         *) printf 'unproven\tthe Rex server the task was created on could not be reached from here, or its block could not be classified' ;;
+      esac
+      ;;
+    hc)
+      if ! fm_backend_hc_record_matches_core "$meta"; then
+        printf 'unproven\tthe hc record has no matching permanent core identity; a missing address on another core cannot prove the old agent stopped'
+        return 0
+      fi
+      case "$(fm_backend_hc_agent_state "$target" "fm-$(basename "$meta" .meta)")" in
+        dead) printf 'dead\t' ;;
+        alive) printf 'alive\t' ;;
+        missing) printf 'gone\t' ;;
+        *) printf 'unproven\tthe recorded hc endpoint is foreign or unreadable' ;;
       esac
       ;;
     t3code)
