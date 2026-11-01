@@ -33,7 +33,9 @@ hc stamps `HC_TERMINAL_ID` into every process an hc terminal starts, including a
 
 ## Task shape and metadata
 
-Each task is one hc terminal running the user's login shell in the project directory, started with `--no-parent --outlive-parent --no-notify` so it is independent of whichever hc terminal Firstmate itself runs in.
+Each task is one hc terminal running the user's login shell in the project directory.
+A verified supervisor becomes its native hc parent, allowing clients such as Herdr to show nested agents.
+Every launch retains `--outlive-parent --no-notify`, so a parent's exit or removal neither stops its children nor types unsolicited notes into the parent.
 The terminal carries these labels:
 
 | Label | Value | Purpose |
@@ -58,12 +60,30 @@ A missing address authorizes recovery only when the core still reports the recor
 Input and durable inbox re-rings for core-bound task records also require that identity, even if a replacement core reuses the old labels and address.
 An input, capture, or close that carries the task label refuses a terminal whose `firstmate.task` or `firstmate.home` label does not match, and a close without a label still refuses a terminal that lacks this home's labels.
 
+## Native parent hierarchy
+
+Native secondmates use their independently verified home binding as the parent for workers and deeper secondmates.
+For a primary running inside an hc terminal, caller markers qualify only when the selected core's live terminal PID is also a real ancestor of the spawning tool.
+An inherited marker alone is insufficient; absent a valid parent, ordinary launches remain standalone.
+
+Tools running through a shared vendor daemon may have no terminal markers or ancestry, so automatic primary discovery is unavailable there.
+For those launches the operator can supply `FM_HC_PARENT_TARGET` (`<session>:<address>`) together with `FM_HC_PARENT_CORE_ID` (the permanent core ID returned by the protocol's `hello` response).
+These are per-invocation overrides; they do not configure or discover a primary endpoint automatically.
+The target must be a live primary terminal without task ownership, or the matching verified native secondmate endpoint.
+An explicit missing, foreign, malformed, wrong-session, or wrong-core request fails rather than silently launching an unlinked terminal.
+The adapter header in [`bin/backends/hc.sh`](../bin/backends/hc.sh) owns exact selection and override mechanics.
+
+A replacement links to its current supervisor at creation.
+Existing independent children retain their original fixed hc parent address across supervisor recovery; they are never reparented or terminated to redraw the hierarchy.
+This is a protocol relationship, separate from Unix process ancestry and from Firstmate's lifecycle authority.
+Herdr UI display itself is not verified; no UI changes are required by this adapter.
+
 ## Operations
 
 | Operation | hc command |
 | --- | --- |
 | Container ensure | `hc server status` plus the `hello` generation handshake over `hc connect` |
-| Create task | `hc run --bg --no-parent --outlive-parent --no-notify --cwd <project> --label ...` |
+| Create task | `hc run --bg` with validated parent selection, independent lifetime, notification suppression, cwd and ownership labels (adapter header) |
 | Capture | `hc read --lines <n>` |
 | Visible capture | `hc read --lines 0` |
 | Styled composer observation | Framed `terminal.attach` with `observe:true`, checked against `terminal.read`; never sends terminal input or resize frames |
@@ -114,12 +134,13 @@ Existing attachment views and legacy endpoints are not adopted or migrated autom
 
 ## Tests
 
-`tests/fm-backend-hc.test.sh` pins routing, core identity, busy state, and refusal behavior against a fake `hc` and real process trees.
+`tests/fm-backend-hc.test.sh` pins routing, parent selection, core identity, busy state, and refusal behavior against a fake `hc` and real process trees.
 `tests/fm-hc-secondmate-lock.test.sh` proves native home-lock ancestry and foreign-owner refusal with real processes.
 `tests/fm-hc-screen.test.sh` checks the read-only framing contract and complete-screen refusals.
 `FM_HC_SECONDMATE_LIVE=1 bin/fm-test-run.sh tests/fm-hc-secondmate-live-e2e.test.sh` exercises a real Codex in a genuinely seeded scratch home, including tool context, correlated replies, lifecycle, and recovery.
 `tests/fm-backend-hc-liveness-live-e2e.test.sh` is the default-on live guard: it launches every installed harness bare in a private core and requires `alive`.
 `tests/fm-backend-hc-smoke.test.sh` drives the real binary in an isolated lab; [`bin/fm-hc-lab.sh`](../bin/fm-hc-lab.sh) owns the isolation and metadata-tripwire contract, and [`tests/hc-test-safety.sh`](../tests/hc-test-safety.sh) owns guarded test teardown.
+The smoke also proves native parent links, deeper nesting, caller ancestry, independent child survival, and replacement selection with token-free shell fixtures.
 The smoke skips when no resolved Core binary or `jq` is available; provisioning and teardown failures fail the test.
 For CI coverage, see [`configuration.md`](configuration.md#runtime-backend-configbackend--fm_backend); the workflow requires `jq` and rejects the `hc not found` skip.
 [`bin/fm-hc-ci-cleanup.sh`](../bin/fm-hc-ci-cleanup.sh) owns job-end cleanup mechanics.

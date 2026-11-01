@@ -3605,6 +3605,33 @@ These live runs used the unchanged `fm-hc-lab.sh` helper inside an additional Li
 The original outside metadata equality check failed because active production metadata changed; that result was retained as a failure and was not treated as isolation proof.
 Only the separately verified kernel boundary and the helper's private-core checks under that boundary support these runs.
 
+### Native parent links
+
+Measured on 2026-11-01 with hc 0.1.16 on Linux aarch64.
+`bin/fm-test-run.sh tests/fm-backend-hc.test.sh` passed all 23 portable cases, including explicit core/session pins, native home-lock bindings, current replacement selection, caller ancestry, stale-marker fallback, and foreign/missing/finished parent refusals.
+`bash tests/fm-backend-hc-smoke.test.sh` passed with the existing lab and guarded teardown, inside an external `bwrap --unshare-all` mount/PID/network boundary.
+That boundary hid the production home and `/run`, replaced `/tmp`, mounted a private `/proc`, cleared inherited environment, and bound only the code, Core executable and task proof directory back in.
+The visible process inventory before provisioning contained only `bwrap`, the test shell and `ps`.
+No production socket or state was contacted, and the production server was not started or stopped.
+
+```text
+hc 0.1.16
+ok - hc hierarchy: explicit primary -> mate link returned by real core
+ok - hc hierarchy: primary -> mate -> leaf nesting uses verified native home binding
+ok - hc hierarchy: actual parent-terminal shell corroborates HC marker without explicit pins
+ok - hc hierarchy: children survive parent program exit and terminal removal at both levels
+ok - hc hierarchy: replacement selects current supervisor, preserves old children and refuses duplicate/missing/foreign parents
+FM_TEST_COMPLETE
+```
+
+Both levels returned the expected native `parent`, `die_with_parent:false`, and `notify:false` through `hc get`.
+The native home-lock consumer was a token-free Bash fixture named `codex`; this verifies protocol and kernel ownership facts, not vendor harness behavior.
+No new vendor-output or model-string classifier was introduced.
+The same existing `create_task` interface serves ordinary workers and native secondmates, including replacements; other runtime backends and harness launch commands were unchanged.
+The guarded teardown returned exit 0 within the namespace.
+Its metadata tripwire covered only the namespace-visible roots; it does not establish byte-identical production metadata outside that boundary, and the earlier outside-metadata drift failure above remains a failure.
+Herdr's rendered nesting and automatic parent discovery for a shared vendor daemon without terminal ancestry remain unverified or unavailable as documented in [`../hc-backend.md`](../hc-backend.md#native-parent-hierarchy).
+
 ### Not verified
 
 - A ship spawn with a real harness; the credentialed lifecycle guard covers a secondmate.

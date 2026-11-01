@@ -94,6 +94,108 @@ wait_for() {
   return 1
 }
 
+# Parent hierarchy is a protocol fact. The native-lock consumer below is a
+# Bash fixture named codex, not a vendor harness or a model-string assertion.
+# Real vendor tool context remains owned by the credentialed secondmate guard.
+unset FM_HC_PARENT_TARGET FM_HC_PARENT_CORE_ID FM_SUPERVISOR_BACKEND FM_SUPERVISOR_TARGET
+PARENT_CORE=$(fm_backend_hc_core_id "$HC_SESSION") || fail 'parent core handshake'
+PARENT=$(fm_backend_hc_cli "$HC_SESSION" run --bg --json --no-parent --outlive-parent --no-notify \
+  --cwd "$WORK_DIR" -- bash --noprofile --norc | jq -er .address) || fail 'shell parent'
+MATE=$(FM_HC_PARENT_TARGET="$HC_SESSION:$PARENT" FM_HC_PARENT_CORE_ID="$PARENT_CORE" \
+  fm_backend_hc_create_task "$HC_SESSION" fm-mate "$WORK_DIR") || fail 'linked mate shell'
+parent_is() { # <address> <expected-parent>
+  fm_backend_hc_get "$HC_SESSION:$1" | jq -e --arg p "$2" \
+    '.parent == $p and .state == "live" and .die_with_parent == false and .notify == false' >/dev/null
+}
+parent_is "$MATE" "$PARENT" || fail 'core did not return the parent and independent lifetime flags'
+pass 'hc hierarchy: explicit primary -> mate link returned by real core'
+
+# Bind the scratch mate home to that terminal's actual shell incarnation.
+MATE_HOME="$TMP_ROOT/mate"
+mkdir -p "$MATE_HOME/state" "$TMP_ROOT/bin"
+printf 'mate\n' > "$MATE_HOME/.fm-secondmate-home"
+. "$ROOT/bin/fm-hc-secondmate-lib.sh"
+fm_hc_secondmate_bind "$MATE_HOME" mate "$HC_SESSION:$MATE" || fail 'bind shell mate'
+ln -s /bin/bash "$TMP_ROOT/bin/codex"
+cat > "$TMP_ROOT/native-parent.sh" <<'SH'
+#!/usr/bin/env bash
+set -eu
+bash "$TEST_ROOT/bin/fm-lock.sh"
+. "$TEST_ROOT/bin/fm-backend.sh"
+fm_backend_source hc
+leaf=$(fm_backend_hc_create_task "$HC_SESSION" "${TEST_LEAF_LABEL:-fm-leaf}" "$TEST_WORK")
+printf '%s\n' "$leaf" > "$TEST_WORK/leaf-address"
+# Verify a real nested caller hint from this terminal as well. The native
+# binding already proves this task-labelled supervisor, regardless of hint.
+[ "$(fm_backend_hc_parent "$HC_SESSION")" = "$HC_TERMINAL_ID" ]
+while [ ! -e "$TEST_WORK/end-mate" ]; do sleep 0.1; done
+SH
+printf -v driver 'env FM_HOME=%q FM_ROOT_OVERRIDE= FM_STATE_OVERRIDE= TEST_ROOT=%q TEST_WORK=%q FM_HC_BIN=%q FM_HC_SOCKET=%q HC_SESSION=%q FM_SUPERVISOR_BACKEND=hc FM_SUPERVISOR_TARGET=%q %q %q' \
+  "$MATE_HOME" "$ROOT" "$WORK_DIR" "$FM_HC_BIN" "$FM_HC_SOCKET" "$HC_SESSION" "$HC_SESSION:$MATE" "$TMP_ROOT/bin/codex" "$TMP_ROOT/native-parent.sh"
+fm_backend_hc_send_text_line "$HC_SESSION:$MATE" "$driver; exit" fm-mate || fail 'start native shell fixture'
+wait_for 10 test -s "$WORK_DIR/leaf-address" || fail 'native shell fixture did not create leaf'
+LEAF=$(cat "$WORK_DIR/leaf-address")
+parent_is "$LEAF" "$MATE" || fail 'native leaf did not link to bound mate'
+pass 'hc hierarchy: primary -> mate -> leaf nesting uses verified native home binding'
+
+# A real program starting inside an unlabelled primary also corroborates its
+# HC hint through ancestry, without an explicit parent override.
+cat > "$TMP_ROOT/ambient-parent.sh" <<'SH'
+#!/usr/bin/env bash
+set -eu
+. "$TEST_ROOT/bin/fm-backend.sh"
+fm_backend_source hc
+fm_backend_hc_create_task "$HC_SESSION" fm-ambient "$TEST_WORK" > "$TEST_WORK/ambient-address"
+SH
+printf -v driver 'env FM_HOME=%q TEST_ROOT=%q TEST_WORK=%q FM_HC_BIN=%q FM_HC_SOCKET=%q HC_SESSION=%q bash %q' \
+  "$FM_HOME" "$ROOT" "$WORK_DIR" "$FM_HC_BIN" "$FM_HC_SOCKET" "$HC_SESSION" "$TMP_ROOT/ambient-parent.sh"
+fm_backend_hc_cli "$HC_SESSION" send --json "$PARENT" -- "$driver" >/dev/null || fail 'ambient driver'
+wait_for 10 test -s "$WORK_DIR/ambient-address" || fail 'ambient shell fixture did not create child'
+AMBIENT=$(cat "$WORK_DIR/ambient-address")
+parent_is "$AMBIENT" "$PARENT" || fail 'ancestor-verified caller did not link'
+pass 'hc hierarchy: actual parent-terminal shell corroborates HC marker without explicit pins'
+
+# Parent program exit and terminal removal must leave both levels running.
+fm_backend_hc_cli "$HC_SESSION" send --json "$PARENT" -- exit >/dev/null || fail 'exit root program'
+finished() { fm_backend_hc_get "$HC_SESSION:$1" | jq -e '.state == "finished"' >/dev/null; }
+wait_for 10 finished "$PARENT" || fail 'root program did not finish'
+fm_backend_hc_cli "$HC_SESSION" rm --json "$PARENT" >/dev/null || fail 'remove root terminal'
+if ! parent_is "$MATE" "$PARENT" || ! parent_is "$LEAF" "$MATE" || ! parent_is "$AMBIENT" "$PARENT"; then
+  fail 'descendant failed to outlive removed root'
+fi
+touch "$WORK_DIR/end-mate"
+wait_for 10 finished "$MATE" || fail 'mate program did not finish'
+fm_backend_hc_cli "$HC_SESSION" rm --json "$MATE" >/dev/null || fail 'remove mate terminal'
+parent_is "$LEAF" "$MATE" || fail 'leaf failed to outlive removed mate'
+pass 'hc hierarchy: children survive parent program exit and terminal removal at both levels'
+
+# Recovery creates a replacement and new children use the current binding;
+# existing independent children keep their original fixed protocol parent.
+REPLACEMENT=$(fm_backend_hc_create_task "$HC_SESSION" fm-mate "$WORK_DIR") || fail 'mate replacement'
+fm_hc_secondmate_bind "$MATE_HOME" mate "$HC_SESSION:$REPLACEMENT" || fail 'replacement binding'
+rm "$WORK_DIR/leaf-address" "$WORK_DIR/end-mate"
+printf -v driver 'env TEST_LEAF_LABEL=fm-leaf2 FM_HOME=%q FM_ROOT_OVERRIDE= FM_STATE_OVERRIDE= TEST_ROOT=%q TEST_WORK=%q FM_HC_BIN=%q FM_HC_SOCKET=%q HC_SESSION=%q FM_SUPERVISOR_BACKEND=hc FM_SUPERVISOR_TARGET=%q %q %q' \
+  "$MATE_HOME" "$ROOT" "$WORK_DIR" "$FM_HC_BIN" "$FM_HC_SOCKET" "$HC_SESSION" "$HC_SESSION:$REPLACEMENT" "$TMP_ROOT/bin/codex" "$TMP_ROOT/native-parent.sh"
+fm_backend_hc_send_text_line "$HC_SESSION:$REPLACEMENT" "$driver; exit" fm-mate || fail 'replacement fixture'
+wait_for 10 test -s "$WORK_DIR/leaf-address" || fail 'replacement leaf'
+NEW_LEAF=$(cat "$WORK_DIR/leaf-address")
+if ! parent_is "$NEW_LEAF" "$REPLACEMENT" || ! parent_is "$LEAF" "$MATE"; then
+  fail 'replacement changed live children or used old parent'
+fi
+if fm_backend_hc_create_task "$HC_SESSION" fm-mate "$WORK_DIR" >/dev/null 2>&1; then fail 'duplicate replacement'; fi
+if FM_HC_PARENT_TARGET="$HC_SESSION:$MATE" FM_HC_PARENT_CORE_ID="$PARENT_CORE" \
+  fm_backend_hc_create_task "$HC_SESSION" fm-missing-parent "$WORK_DIR" >/dev/null 2>&1; then fail 'missing explicit parent'; fi
+if FM_HC_PARENT_TARGET="$HC_SESSION:$NEW_LEAF" FM_HC_PARENT_CORE_ID="$PARENT_CORE" \
+  fm_backend_hc_create_task "$HC_SESSION" fm-foreign-parent "$WORK_DIR" >/dev/null 2>&1; then fail 'foreign task parent'; fi
+pass 'hc hierarchy: replacement selects current supervisor, preserves old children and refuses duplicate/missing/foreign parents'
+touch "$WORK_DIR/end-mate"
+wait_for 10 finished "$REPLACEMENT" || fail 'replacement fixture did not exit'
+FM_HOME="$MATE_HOME" fm_backend_hc_kill "$HC_SESSION:$LEAF" '' fm-leaf || fail 'close independent leaf'
+# NEW_LEAF is owned by the scratch mate home, not the parent test home.
+FM_HOME="$MATE_HOME" fm_backend_hc_kill "$HC_SESSION:$NEW_LEAF" '' fm-leaf2 || fail 'close replacement leaf'
+fm_backend_hc_cli "$HC_SESSION" rm --json "$REPLACEMENT" >/dev/null || fail 'remove replacement'
+fm_backend_kill hc "$HC_SESSION:$AMBIENT" fm-ambient || fail 'close ambient child'
+
 LABEL=fm-smoke1
 SES=$(fm_backend_hc_container_ensure) || fail "container_ensure failed"
 assert_equals "$SES" "$HC_TEST_SES" "container_ensure names the lab session"

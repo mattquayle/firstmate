@@ -357,13 +357,104 @@ fm_backend_hc_container_ensure() {
   printf '%s' "$session"
 }
 
-# fm_backend_hc_create_task: start a login shell terminal in <cwd> for
-# <window-label>, refusing a live duplicate in this home. Prints the address.
-# --no-parent and --outlive-parent keep the terminal independent of whichever
-# hc terminal firstmate itself runs in; --no-notify keeps hc from typing notes
-# into any parent.
+# Native parent selection (only for new endpoints, including replacements):
+# - A native secondmate's own state/.hc-secondmate.json wins, subject to its
+#   existing live home-lock, terminal-incarnation, core and parent-label proof.
+# - Outside that binding, an operator may set FM_HC_PARENT_TARGET=session:t7
+#   and FM_HC_PARENT_CORE_ID=<hello core.id> together for this invocation.
+#   FM_SUPERVISOR_BACKEND=hc with FM_SUPERVISOR_TARGET is also an explicit
+#   request, requiring the same core pin. Unlabelled primary terminals are
+#   allowed; task-labelled or foreign-home terminals require the native binding.
+# - Otherwise HC_TERMINAL_ID is only a hint: a live terminal on the selected
+#   core must have a kernel pid in this caller's ancestry and no task labels.
+#   Stale/foreign ambient hints fall back to standalone, never endpoint scans.
+# Explicit/bound requests fail closed on missing, finished, foreign, wrong-core
+# or wrong-session targets. With no proved parent use --no-parent. All launches
+# keep --outlive-parent --no-notify: protocol hierarchy is not Unix ancestry or
+# lifecycle authority. Existing children are never reparented or terminated.
+fm_backend_hc_parent() { # <session> -> address, or empty for standalone
+  local session=$1 target='' core='' json='' binding="$FM_HOME/state/.hc-secondmate.json"
+  local native=0 explicit=0 pid candidate hops=0 home
+  fm_backend_hc_atom_valid "$session" || { echo "error: invalid hc parent session '$session'" >&2; return 1; }
+  if [ -e "$binding" ] || [ -L "$binding" ]; then
+    [ -f "$binding" ] && [ ! -L "$binding" ] || { echo "error: invalid native hc parent binding" >&2; return 1; }
+    if ! target=$(jq -er '.target | select(type == "string")' "$binding") \
+      || ! core=$(jq -er '.core | select(type == "string" and length > 0)' "$binding"); then
+      echo "error: malformed native hc parent binding '$binding'" >&2; return 1
+    fi
+    native=1
+  fi
+  if [ "${FM_HC_PARENT_TARGET+x}${FM_HC_PARENT_CORE_ID+x}" != '' ]; then
+    [ -n "${FM_HC_PARENT_TARGET:-}" ] && [ -n "${FM_HC_PARENT_CORE_ID:-}" ] || {
+      echo "error: set both FM_HC_PARENT_TARGET and FM_HC_PARENT_CORE_ID for an explicit hc parent" >&2; return 1;
+    }
+    if [ "$native" = 1 ] && { [ "$target" != "$FM_HC_PARENT_TARGET" ] || [ "$core" != "$FM_HC_PARENT_CORE_ID" ]; }; then
+      echo "error: explicit hc parent conflicts with this native supervisor binding" >&2; return 1
+    fi
+    target=$FM_HC_PARENT_TARGET core=$FM_HC_PARENT_CORE_ID explicit=1
+  fi
+  if [ "${FM_SUPERVISOR_BACKEND:-}" = hc ]; then
+    if [ -n "$target" ] && [ "$target" != "${FM_SUPERVISOR_TARGET:-}" ]; then
+      echo "error: hc parent conflicts with FM_SUPERVISOR_TARGET" >&2; return 1
+    fi
+    target=${FM_SUPERVISOR_TARGET:-} explicit=1
+    [ -n "$target" ] && [ -n "$core" ] || {
+      echo "error: explicit hc supervisor needs a native binding or FM_HC_PARENT_TARGET and FM_HC_PARENT_CORE_ID" >&2; return 1;
+    }
+  fi
+  if [ "$native" = 0 ] && [ "$explicit" = 0 ]; then
+    fm_backend_hc_address_valid "${HC_TERMINAL_ID:-}" || return 0
+    target="$session:$HC_TERMINAL_ID"
+  fi
+  fm_backend_hc_parse_target "$target" && [ "$FM_BACKEND_HC_SESSION" = "$session" ] || {
+    echo "error: invalid hc parent '$target' for session '$session'" >&2; return 1;
+  }
+  if json=$(fm_backend_hc_get "$target") && printf '%s' "$json" | jq -e --arg a "${target#*:}" '
+    .address == $a and .state == "live" and (.labels | type == "object")' >/dev/null; then
+    if [ "$native" = 1 ]; then
+      [ "$(fm_backend_hc_endpoint_state "$target")" = ready ] || {
+        echo "error: native hc parent ownership is not verified for '$target'" >&2; return 1;
+      }
+    else
+      home=$(fm_backend_hc_hometag)
+      if ! printf '%s' "$json" | jq -e --arg h "$home" '
+        (.labels["firstmate.home"] == null or .labels["firstmate.home"] == $h)
+        and .labels["firstmate.task"] == null' >/dev/null; then
+        if [ "$explicit" = 0 ]; then return 0; fi
+        echo "error: hc parent '$target' has foreign home or task ownership" >&2; return 1
+      fi
+    fi
+    if [ "$native" = 1 ] || [ "$explicit" = 1 ]; then
+      [ "$(fm_backend_hc_core_id "$session")" = "$core" ] || {
+        echo "error: hc parent '$target' core identity does not match the requested pin" >&2; return 1;
+      }
+    else
+      pid=$(printf '%s' "$json" | jq -er '.pid | select(type == "number" and . > 1)') || return 0
+      # $$ remains the invoking shell across command substitutions. Only a
+      # real ancestor proves that a tool did not inherit another caller's hint.
+      candidate=$$
+      while [ "$candidate" != "$pid" ]; do
+        case "$candidate" in ''|0|1|*[!0-9]*) return 0 ;; esac
+        [ "$hops" -lt 64 ] || return 0
+        candidate=$(LC_ALL=C ps -o ppid= -p "$candidate" 2>/dev/null | tr -d ' ') || return 0
+        hops=$((hops + 1))
+      done
+    fi
+    printf '%s' "${target#*:}"
+    return 0
+  fi
+  if [ "$native" = 0 ] && [ "$explicit" = 0 ]; then return 0; fi
+  echo "error: hc parent '$target' is missing, finished, or unreadable" >&2
+  return 1
+}
+
+# Start a login shell in <cwd> for <window-label>, refusing a live duplicate
+# in this home. Prints the address; parent selection above never changes labels.
 fm_backend_hc_create_task() {  # <session> <window-label> <cwd>
-  local session=$1 label=$2 cwd=$3 home scoped dup out address
+  local session=$1 label=$2 cwd=$3 home scoped dup out address parent
+  local parent_args=(--no-parent)
+  parent=$(fm_backend_hc_parent "$session") || return 1
+  [ -z "$parent" ] || parent_args=(--parent "$parent")
   home=$(fm_backend_hc_hometag)
   scoped=$(fm_backend_hc_scoped_label "$label")
   dup=$(fm_backend_hc_cli "$session" ls --json --label "firstmate.task=$label" --label "firstmate.home=$home" 2>/dev/null) \
@@ -374,7 +465,7 @@ fm_backend_hc_create_task() {  # <session> <window-label> <cwd>
     echo "error: hc terminal for $label already exists in session '$session'" >&2
     return 1
   fi
-  out=$(fm_backend_hc_cli "$session" run --bg --json --no-parent --outlive-parent --no-notify \
+  out=$(fm_backend_hc_cli "$session" run --bg --json "${parent_args[@]}" --outlive-parent --no-notify \
     --cwd "$cwd" \
     --label "firstmate.task=$label" --label "firstmate.home=$home" \
     --label "herdr.space=${FM_HC_SPACE:-fm-$home}" --label "herdr.tab=$scoped" 2>&1) \

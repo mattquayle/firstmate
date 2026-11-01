@@ -80,6 +80,7 @@ hc_shell() {  # <script>
     HC_SESSION=fmtest bash -c '
       . "'"$FM_TEST_ROOT"'/bin/fm-backend.sh"
       fm_backend_source hc || { echo "source failed" >&2; exit 90; }
+      unset FM_HC_PARENT_TARGET FM_HC_PARENT_CORE_ID FM_SUPERVISOR_BACKEND FM_SUPERVISOR_TARGET HC_TERMINAL_ID
       HOMETAG=$(fm_backend_hometag)
       '"$1"
 }
@@ -135,6 +136,99 @@ test_create_task_is_independent_labeled_and_refuses_duplicates() {
   expect_refused hc_shell 'fm_backend_hc_create_task fmtest fm-a1 /proj'
   assert_not_contains "$(cat "$D/log")" $'\x1frun\x1f' "a live duplicate must not start a second terminal"
   pass "hc: create_task starts an independent labeled terminal and refuses a duplicate"
+}
+
+test_parent_selection_and_explicit_refusals() {
+  local out tag req
+  setup_case parents
+  tag=$(hometag_of)
+  printf '{"address":"t9"}\n' > "$D/run.json"
+  write_terminal "$D" t1 live '' '' bash bash
+  jq '.labels={}' "$D/t1.json" > "$D/tmp" && mv "$D/tmp" "$D/t1.json"
+  write_terminal "$D" t2 live fm-foreign "$tag" bash bash
+  write_terminal "$D" t3 live '' foreign-home bash bash
+  write_terminal "$D" t4 finished '' '' bash bash
+  jq '.labels={}' "$D/t4.json" > "$D/tmp" && mv "$D/tmp" "$D/t4.json"
+  out=$(hc_shell 'FM_HC_PARENT_TARGET=fmtest:t1 FM_HC_PARENT_CORE_ID=core-test fm_backend_hc_create_task fmtest fm-child /proj')
+  assert_equals "$out" t9 'explicit core-pinned primary works outside its terminal'
+  out=$(grep $'\x1frun\x1f' "$D/log")
+  assert_contains "$out" $'--parent\x1ft1' 'run records the explicit protocol parent'
+  assert_not_contains "$out" --no-parent 'linked launch has no conflicting parent flag'
+  for want in --outlive-parent --no-notify "firstmate.home=$tag" firstmate.task=fm-child; do
+    assert_contains "$out" "$want" 'link preserves lifetime, notification and ownership flags'
+  done
+  : > "$D/log"
+  for req in \
+    'FM_HC_PARENT_TARGET=fmtest:t1' \
+    'FM_HC_PARENT_CORE_ID=core-test' \
+    'FM_HC_PARENT_TARGET= FM_HC_PARENT_CORE_ID=core-test' \
+    'FM_HC_PARENT_TARGET=other:t1 FM_HC_PARENT_CORE_ID=core-test' \
+    'FM_HC_PARENT_TARGET=fmtest:t1 FM_HC_PARENT_CORE_ID=other-core' \
+    'FM_HC_PARENT_TARGET=fmtest:t99 FM_HC_PARENT_CORE_ID=core-test' \
+    'FM_HC_PARENT_TARGET=fmtest:t2 FM_HC_PARENT_CORE_ID=core-test' \
+    'FM_HC_PARENT_TARGET=fmtest:t3 FM_HC_PARENT_CORE_ID=core-test' \
+    'FM_HC_PARENT_TARGET=fmtest:t4 FM_HC_PARENT_CORE_ID=core-test' \
+    'FM_HC_PARENT_TARGET=bad:target FM_HC_PARENT_CORE_ID=core-test' \
+    'FM_SUPERVISOR_BACKEND=hc FM_SUPERVISOR_TARGET=fmtest:t1'; do
+    expect_refused hc_shell "$req fm_backend_hc_create_task fmtest fm-child /proj"
+  done
+  assert_not_contains "$(cat "$D/log")" $'\x1frun\x1f' 'invalid explicit parents never create endpoints'
+  pass 'hc parents: explicit session/core pin, missing/foreign/finished refusal and original flags'
+}
+
+test_parent_hint_requires_real_ancestry() {
+  local out
+  setup_case parent-hint
+  printf '{"address":"t9"}\n' > "$D/run.json"
+  write_terminal "$D" t1 live '' '' bash bash
+  jq '.labels={}' "$D/t1.json" > "$D/tmp" && mv "$D/tmp" "$D/t1.json"
+  # The test shell really is an ancestor of hc_shell; pid 1 never qualifies.
+  jq --argjson p "$$" '.pid=$p' "$D/t1.json" > "$D/tmp"
+  mv "$D/tmp" "$D/t1.json"
+  out=$(hc_shell 'HC_TERMINAL_ID=t1 fm_backend_hc_parent fmtest')
+  assert_equals "$out" t1 'a proved ancestor may parent without operator pins'
+  jq '.pid=1' "$D/t1.json" > "$D/tmp" && mv "$D/tmp" "$D/t1.json"
+  out=$(hc_shell 'HC_TERMINAL_ID=t1 fm_backend_hc_create_task fmtest fm-child /proj')
+  assert_equals "$out" t9 'stale inherited markers allow standalone launch'
+  assert_contains "$(cat "$D/log")" --no-parent 'unproved caller hint never links'
+  assert_equals "$(hc_shell 'HC_TERMINAL_ID=t99 fm_backend_hc_parent fmtest')" '' 'missing ambient hint is standalone'
+  assert_equals "$(hc_shell 'HC_TERMINAL_ID=invalid fm_backend_hc_parent fmtest')" '' 'invalid ambient hint is standalone'
+  pass 'hc parents: kernel ancestry corroborates caller hint; stale/missing markers stay standalone'
+}
+
+test_native_parent_uses_current_home_binding() {
+  local owner stamp out standin
+  setup_case native-parent
+  mkdir -p "$HOMEDIR/state" "$D/agent"
+  printf 'mate\n' > "$HOMEDIR/.fm-secondmate-home"
+  standin=$(fm_agent_standin "$D/standin") || fail 'no agent stand-in'
+  cp "$standin" "$D/agent/codex"
+  "$D/agent/codex" 60 &
+  owner=$!
+  printf '%s\n' "$owner" > "$HOMEDIR/state/.lock"
+  stamp=$(LC_ALL=C ps -o lstart= -p "$$")
+  jq -n --arg home "$HOMEDIR" --arg p "$$" --arg stamp "$stamp" \
+    '{version:1,home:$home,id:"mate",target:"fmtest:t1",pid:$p,stamp:$stamp,core:"core-test",owner:"parent-home"}' \
+    > "$HOMEDIR/state/.hc-secondmate.json"
+  write_terminal "$D" t1 live fm-mate parent-home bash bash
+  write_terminal "$D" t2 live fm-mate parent-home bash bash
+  out=$(hc_shell 'FM_SUPERVISOR_BACKEND=hc FM_SUPERVISOR_TARGET=fmtest:t1 fm_backend_hc_parent fmtest')
+  assert_equals "$out" t1 'native binding authorizes parent-home-labelled supervisor'
+  expect_refused hc_shell 'FM_HC_PARENT_TARGET=fmtest:t2 FM_HC_PARENT_CORE_ID=core-test fm_backend_hc_parent fmtest'
+  expect_refused hc_shell 'FM_SUPERVISOR_BACKEND=hc FM_SUPERVISOR_TARGET=fmtest:t2 fm_backend_hc_parent fmtest'
+  expect_refused hc_shell 'FAKE_HC_CORE_ID=wrong fm_backend_hc_parent fmtest'
+  expect_refused hc_shell 'fm_backend_hc_parent other'
+  # A recovered supervisor rewrites its own binding. New endpoints use that
+  # replacement, without looking up or modifying any existing child's parent.
+  jq '.target="fmtest:t2"' "$HOMEDIR/state/.hc-secondmate.json" > "$D/tmp"
+  mv "$D/tmp" "$HOMEDIR/state/.hc-secondmate.json"
+  assert_equals "$(hc_shell 'fm_backend_hc_parent fmtest')" t2 'replacement binding selects current supervisor'
+  kill "$owner" 2>/dev/null || true
+  wait "$owner" 2>/dev/null || true
+  expect_refused hc_shell 'fm_backend_hc_parent fmtest'
+  printf '{}\n' > "$HOMEDIR/state/.hc-secondmate.json"
+  expect_refused hc_shell 'fm_backend_hc_parent fmtest'
+  pass 'hc parents: native home/core/lock binding and replacement supervisor selection fail closed'
 }
 
 test_control_interrupt_delivers_the_harness_keys() {
@@ -463,6 +557,9 @@ test_hc_incomplete_process_scan_refuses_dead() {
 }
 
 fm_test_run \
+  test_parent_selection_and_explicit_refusals \
+  test_parent_hint_requires_real_ancestry \
+  test_native_parent_uses_current_home_binding \
   test_hc_native_busy_and_home_scope \
   test_hc_incomplete_process_scan_refuses_dead \
   test_secondmate_recovery_refuses_foreign_and_malformed_endpoints \
