@@ -102,13 +102,14 @@ PARENT_CORE=$(fm_backend_hc_core_id "$HC_SESSION") || fail 'parent core handshak
 PARENT=$(fm_backend_hc_cli "$HC_SESSION" run --bg --json --no-parent --outlive-parent --no-notify \
   --cwd "$WORK_DIR" -- bash --noprofile --norc | jq -er .address) || fail 'shell parent'
 MATE=$(FM_HC_PARENT_TARGET="$HC_SESSION:$PARENT" FM_HC_PARENT_CORE_ID="$PARENT_CORE" \
-  fm_backend_hc_create_task "$HC_SESSION" fm-mate "$WORK_DIR") || fail 'linked mate shell'
+  fm_backend_hc_create_task "$HC_SESSION" fm-mate "$WORK_DIR" secondmate) || fail 'linked mate shell'
 parent_is() { # <address> <expected-parent>
   fm_backend_hc_get "$HC_SESSION:$1" | jq -e --arg p "$2" \
     '.parent == $p and .state == "live" and .die_with_parent == false and .notify == false' >/dev/null
 }
 parent_is "$MATE" "$PARENT" || fail 'core did not return the parent and independent lifetime flags'
 pass 'hc hierarchy: explicit primary -> mate link returned by real core'
+MATE_NAME=$(fm_backend_hc_get "$HC_SESSION:$MATE" | jq -er '.name | select(test("^mate-supervisor-[0-9a-f]{8}$"))') || fail 'real secondmate role name'
 
 # Bind the scratch mate home to that terminal's actual shell incarnation.
 MATE_HOME="$TMP_ROOT/mate"
@@ -137,6 +138,7 @@ wait_for 10 test -s "$WORK_DIR/leaf-address" || fail 'native shell fixture did n
 LEAF=$(cat "$WORK_DIR/leaf-address")
 parent_is "$LEAF" "$MATE" || fail 'native leaf did not link to bound mate'
 pass 'hc hierarchy: primary -> mate -> leaf nesting uses verified native home binding'
+fm_backend_hc_get "$HC_SESSION:$LEAF" | jq -e '.name | test("^leaf-[0-9a-f]{8}$")' >/dev/null || fail 'real worker task name'
 
 # A real program starting inside an unlabelled primary also corroborates its
 # HC hint through ancestry, without an explicit parent override.
@@ -171,7 +173,8 @@ pass 'hc hierarchy: children survive parent program exit and terminal removal at
 
 # Recovery creates a replacement and new children use the current binding;
 # existing independent children keep their original fixed protocol parent.
-REPLACEMENT=$(fm_backend_hc_create_task "$HC_SESSION" fm-mate "$WORK_DIR") || fail 'mate replacement'
+REPLACEMENT=$(fm_backend_hc_create_task "$HC_SESSION" fm-mate "$WORK_DIR" secondmate) || fail 'mate replacement'
+assert_equals "$MATE_NAME" "$(fm_backend_hc_get "$HC_SESSION:$REPLACEMENT" | jq -r .name)" 'supervisor replacement keeps its name'
 fm_hc_secondmate_bind "$MATE_HOME" mate "$HC_SESSION:$REPLACEMENT" || fail 'replacement binding'
 rm "$WORK_DIR/leaf-address" "$WORK_DIR/end-mate"
 printf -v driver 'env TEST_LEAF_LABEL=fm-leaf2 FM_HOME=%q FM_ROOT_OVERRIDE= FM_STATE_OVERRIDE= TEST_ROOT=%q TEST_WORK=%q FM_HC_BIN=%q FM_HC_SOCKET=%q HC_SESSION=%q FM_SUPERVISOR_BACKEND=hc FM_SUPERVISOR_TARGET=%q %q %q' \
@@ -195,6 +198,30 @@ FM_HOME="$MATE_HOME" fm_backend_hc_kill "$HC_SESSION:$LEAF" '' fm-leaf || fail '
 FM_HOME="$MATE_HOME" fm_backend_hc_kill "$HC_SESSION:$NEW_LEAF" '' fm-leaf2 || fail 'close replacement leaf'
 fm_backend_hc_cli "$HC_SESSION" rm --json "$REPLACEMENT" >/dev/null || fail 'remove replacement'
 fm_backend_kill hc "$HC_SESSION:$AMBIENT" fm-ambient || fail 'close ambient child'
+
+# Names are presentation only. Distinct raw IDs and homes survive the same
+# readable prefix; an unrelated terminal holding a derived name must block
+# create atomically without becoming this task's endpoint.
+NAMES=''
+for raw in fm-Issue.Priority_Review fm-issue-priority-review fm-a-very-long-shared-prefix-task-one fm-a-very-long-shared-prefix-task-two; do
+  a=$(fm_backend_hc_create_task "$HC_SESSION" "$raw" "$WORK_DIR") || fail 'normalized task create'
+  n=$(fm_backend_hc_get "$HC_SESSION:$a" | jq -er '.name') || fail 'named task get'
+  [[ "$n" =~ ^[a-z0-9][a-z0-9-]*-[0-9a-f]{8}$ ]] && [ "${#n}" -le 32 ] || fail 'invalid or overlong core name'
+  NAMES="$NAMES$n
+"
+done
+mkdir -p "$TMP_ROOT/other-home"
+other=$(FM_HOME="$TMP_ROOT/other-home" fm_backend_hc_create_task "$HC_SESSION" fm-issue-priority-review "$WORK_DIR") || fail 'other home same task'
+other_name=$(fm_backend_hc_get "$HC_SESSION:$other" | jq -er '.name') || fail 'other home name'
+assert_equals 5 "$(printf '%s%s\n' "$NAMES" "$other_name" | sort -u | wc -l | tr -d ' ')" 'real names disambiguate normalization, truncation and home'
+reserved=$(fm_backend_hc_task_name fm-reserved)
+occupant=$(fm_backend_hc_cli "$HC_SESSION" run --json --bg --no-parent --outlive-parent --no-notify --name "$reserved" -- bash --noprofile --norc | jq -er .address) || fail 'reserve collision name'
+if fm_backend_hc_create_task "$HC_SESSION" fm-reserved "$WORK_DIR" >"$TMP_ROOT/collision.out" 2>&1; then fail 'name collision accepted'; fi
+fm_backend_hc_get "$HC_SESSION:$occupant" | jq -e '.state == "live" and .labels["firstmate.task"] == null' >/dev/null || fail 'collision adopted or damaged foreign terminal'
+fm_backend_hc_cli "$HC_SESSION" kill --json "$occupant" >/dev/null || fail 'release name'
+reused=$(fm_backend_hc_create_task "$HC_SESSION" fm-reserved "$WORK_DIR") || fail 'finished names must be reusable'
+assert_equals "$reserved" "$(fm_backend_hc_get "$HC_SESSION:$reused" | jq -r .name)" 'replacement retains the name'
+pass 'hc names: real-core readable role/task names, normalization/truncation/home uniqueness, atomic collision refusal and finished-name reuse'
 
 LABEL=fm-smoke1
 SES=$(fm_backend_hc_container_ensure) || fail "container_ensure failed"

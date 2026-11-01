@@ -39,7 +39,10 @@ case "$cmd" in
     printf '{"jsonrpc":"2.0","id":1,"result":{"generation":%s,"core":{"id":"%s"}}}\n' "${FAKE_HC_GENERATION:-1}" "${FAKE_HC_CORE_ID:-core-test}"
     ;;
   ls) cat "$D/ls.json" 2>/dev/null || printf '{"terminals":[]}\n' ;;
-  run) cat "$D/run.json" ;;
+  run)
+    [ ! -f "$D/run.exit" ] || { printf '{"error":{"kind":"name_taken"}}\n' >&2; exit "$(cat "$D/run.exit")"; }
+    cat "$D/run.json"
+    ;;
   get)
     [ -f "$D/$last.exit" ] && exit "$(cat "$D/$last.exit")"
     [ -f "$D/$last.json" ] || { printf '{"error":{"kind":"not_found"}}\n' >&2; exit 3; }
@@ -136,6 +139,50 @@ test_create_task_is_independent_labeled_and_refuses_duplicates() {
   expect_refused hc_shell 'fm_backend_hc_create_task fmtest fm-a1 /proj'
   assert_not_contains "$(cat "$D/log")" $'\x1frun\x1f' "a live duplicate must not start a second terminal"
   pass "hc: create_task starts an independent labeled terminal and refuses a duplicate"
+}
+
+test_names_are_readable_bounded_scoped_and_fail_closed() {
+  local names name out
+  setup_case names
+  printf '{"address":"t9"}\n' > "$D/run.json"
+  names=$(hc_shell '
+    fm_backend_hc_task_name fm-factory secondmate
+    echo
+    fm_backend_hc_task_name fm-issue-priority-review scout
+    echo
+    fm_backend_hc_task_name fm-Long.Prefix_That-Is-More-Than-Thirty-Two-Characters-A
+    echo
+    fm_backend_hc_task_name fm-Long.Prefix_That-Is-More-Than-Thirty-Two-Characters-B
+    echo
+    fm_backend_hc_task_name fm-Issue.Priority_Review
+    echo
+    fm_backend_hc_task_name fm-issue_priority-review
+    echo
+    FM_HOME="$FM_HOME/other" fm_backend_hc_task_name fm-factory secondmate
+    echo
+    fm_backend_hc_task_name fm-...
+    echo
+    fm_backend_hc_task_name fm-a-very-long-secondmate-id secondmate
+    echo
+  ')
+  while IFS= read -r name; do
+    [[ "$name" =~ ^[a-z0-9][a-z0-9-]*-[0-9a-f]{8}$ ]] || fail "invalid hc name: $name"
+    [ "${#name}" -le 32 ] || fail "hc name is too long: $name"
+  done <<< "$names"
+  assert_equals 9 "$(printf '%s\n' "$names" | sort -u | wc -l | tr -d ' ')" 'normalization, truncation and other homes remain distinct'
+  assert_contains "$names" factory-supervisor- 'secondmate role is visible'
+  assert_contains "$names" issue-priority-review- 'task id is readable'
+  assert_contains "$names" task- 'empty normalized name has a readable fallback'
+  assert_contains "$(printf '%s\n' "$names" | tail -1)" -supervisor- 'long secondmate ids retain the role'
+
+  hc_shell 'fm_backend_hc_create_task fmtest fm-factory /proj secondmate' >/dev/null || fail 'named secondmate create'
+  out=$(cat "$D/log")
+  assert_contains "$out" $'--name\x1ffactory-supervisor-' 'create carries the supported slug name'
+  : > "$D/log"
+  printf '1\n' > "$D/run.exit"
+  expect_refused hc_shell 'fm_backend_hc_create_task fmtest fm-factory /proj secondmate'
+  assert_equals 1 "$(grep -c $'\x1frun\x1f' "$D/log")" 'a core name collision is not retried nameless or adopted'
+  pass 'hc names: readable role/task slugs, bounded length, raw/home disambiguation and collision refusal'
 }
 
 test_parent_selection_and_explicit_refusals() {
@@ -567,6 +614,7 @@ fm_test_run \
   test_hc_is_spawn_capable_and_never_autodetected \
   test_required_tool_check_uses_the_adapter_resolver \
   test_create_task_is_independent_labeled_and_refuses_duplicates \
+  test_names_are_readable_bounded_scoped_and_fail_closed \
   test_control_interrupt_delivers_the_harness_keys \
   test_foreign_or_unlabeled_terminal_gets_no_input_and_no_close \
   test_invalid_session_never_reaches_hc \

@@ -3632,6 +3632,30 @@ The guarded teardown returned exit 0 within the namespace.
 Its metadata tripwire covered only the namespace-visible roots; it does not establish byte-identical production metadata outside that boundary, and the earlier outside-metadata drift failure above remains a failure.
 Herdr's rendered nesting and automatic parent discovery for a shared vendor daemon without terminal ancestry remain unverified or unavailable as documented in [`../hc-backend.md`](../hc-backend.md#native-parent-hierarchy).
 
+### Native agent names
+
+Measured on 2026-11-01 with hc 0.1.16 on Linux aarch64.
+`bin/fm-test-run.sh tests/fm-backend-hc.test.sh tests/fm-hc-secondmate-lock.test.sh tests/fm-hc-screen.test.sh tests/fm-hc-lab.test.sh` passed.
+`bash tests/fm-backend-hc-smoke.test.sh` passed under the same external mount/PID/network boundary and lab/safety owners described above, including guarded teardown with exit 0.
+
+```text
+ok - hc names: readable role/task slugs, bounded length, raw/home disambiguation and collision refusal
+ok - hc names: real-core readable role/task names, normalization/truncation/home uniqueness, atomic collision refusal and finished-name reuse
+```
+
+The real core returned the derived names on both levels of the primary -> secondmate -> worker hierarchy.
+The existing hierarchy, home-lock, ownership, independent lifetime, send, capture, cwd and close checks also passed with names enabled.
+`hc run --help` exposes `--name`; `hc schema` exposes `terminal.run.name` but no terminal rename method.
+A separate isolated protocol probe returned `name: "factory-supervisor"`, refused `Factory supervisor` with `invalid_params`, and refused a second live `factory-supervisor` with `name_taken`.
+Changing its terminal title to `Issue priority review` left the name `factory-supervisor` intact.
+The finished name could be reused without removing or restarting another terminal.
+
+Herdr app v0.1.11 source at `e12fd31866f33cb613922d0b33ea506e6f23ce3c` passes the core name through [`terminals_listed`](https://github.com/herdrdev/herdr-app/blob/e12fd31866f33cb613922d0b33ea506e6f23ce3c/src/window.rs) and selects `k.name || k.template || k.program?.name || k.address` in the nested [`subRow`](https://github.com/herdrdev/herdr-app/blob/e12fd31866f33cb613922d0b33ea506e6f23ce3c/defaults/mods/agents/main.js).
+That path does not select the terminal title, status title, or an arbitrary label.
+No app executable or connected GUI was available on this host, so rendered nested rows and the connected app's exact version remain unverified; readable slug rendering is inferred from that source and the proven core record.
+This change uses no harness-output classifier, status synthesis, or UI modification.
+Other runtime backends and harness launch commands retain their existing behavior; the hc create path alone consumes the task kind.
+
 ### Not verified
 
 - A ship spawn with a real harness; the credentialed lifecycle guard covers a secondmate.

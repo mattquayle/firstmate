@@ -28,8 +28,17 @@
 # and firstmate.home=<hometag> (the physical FM_HOME, via
 # bin/fm-backend-hometag-lib.sh). Operations refuse foreign home labels and,
 # when given an expected task label, require it too, so a
-# recorded address can never steer input into another home's terminal. hc
-# names are not used: they allow only 1-32 of [a-z0-9_-], narrower than task ids.
+# recorded address can never steer input into another home's terminal.
+# Human-facing names are separate from ownership: create_task derives a readable
+# slug from the task id and kind (secondmates append "supervisor"), with a
+# checksum of the full home-scoped label. The 23-byte prefix plus dash and
+# 8-hex checksum fits hc's 32-byte lowercase name limit. Normalization and
+# truncation retain distinct suffixes for different raw labels/homes; any
+# remaining collision is refused atomically by hc, never adopted or retried
+# without a name. Finished terminals release their names for replacements.
+# Herdr.app's nested agent rows prefer this core name over template/program,
+# not the terminal title. Names are creation-only; existing endpoints are
+# never restarted or rewritten just to rename them.
 #
 # Visibility in Herdr.app: the app shows a terminal that carries
 # herdr.space=<id> and herdr.tab=<id> labels, and an unknown id becomes a new
@@ -448,15 +457,31 @@ fm_backend_hc_parent() { # <session> -> address, or empty for standalone
   return 1
 }
 
+# Presentation only: labels and validated addresses remain the identity boundary.
+fm_backend_hc_task_name() { # <window-label> [kind]
+  local label=$1 kind=${2:-ship} slug checksum
+  slug=${label#fm-}
+  slug=$(printf '%s' "$slug" | LC_ALL=C tr '[:upper:]' '[:lower:]' | LC_ALL=C tr -cs 'a-z0-9' '-' | cut -c1-23 | sed 's/^-*//; s/-*$//')
+  if [ "$kind" = secondmate ]; then
+    slug=$(printf '%s' "$slug" | cut -c1-12 | sed 's/-*$//')
+    [ -n "$slug" ] || slug=task
+    slug="$slug-supervisor"
+  fi
+  [ -n "$slug" ] || slug=task
+  checksum=$(printf '%s' "$(fm_backend_hc_scoped_label "$label")" | cksum | awk '{printf "%08x", $1}')
+  printf '%s-%s' "$slug" "$checksum"
+}
+
 # Start a login shell in <cwd> for <window-label>, refusing a live duplicate
 # in this home. Prints the address; parent selection above never changes labels.
-fm_backend_hc_create_task() {  # <session> <window-label> <cwd>
-  local session=$1 label=$2 cwd=$3 home scoped dup out address parent
+fm_backend_hc_create_task() {  # <session> <window-label> <cwd> [kind]
+  local session=$1 label=$2 cwd=$3 kind=${4:-ship} home scoped dup out address parent name
   local parent_args=(--no-parent)
   parent=$(fm_backend_hc_parent "$session") || return 1
   [ -z "$parent" ] || parent_args=(--parent "$parent")
   home=$(fm_backend_hc_hometag)
   scoped=$(fm_backend_hc_scoped_label "$label")
+  name=$(fm_backend_hc_task_name "$label" "$kind") || return 1
   dup=$(fm_backend_hc_cli "$session" ls --json --label "firstmate.task=$label" --label "firstmate.home=$home" 2>/dev/null) \
     || { echo "error: 'hc ls' failed for session '$session'; cannot create $label" >&2; return 1; }
   printf '%s' "$dup" | jq -e 'type == "object" and (.terminals | type == "array")' >/dev/null 2>&1 \
@@ -466,7 +491,7 @@ fm_backend_hc_create_task() {  # <session> <window-label> <cwd>
     return 1
   fi
   out=$(fm_backend_hc_cli "$session" run --bg --json "${parent_args[@]}" --outlive-parent --no-notify \
-    --cwd "$cwd" \
+    --cwd "$cwd" --name "$name" \
     --label "firstmate.task=$label" --label "firstmate.home=$home" \
     --label "herdr.space=${FM_HC_SPACE:-fm-$home}" --label "herdr.tab=$scoped" 2>&1) \
     || { echo "error: hc run failed for $label: $out" >&2; return 1; }

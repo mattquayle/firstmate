@@ -4737,7 +4737,7 @@ if [ "$RELAUNCH" -eq 1 ]; then
     SES=${T%%:*}
   elif [ "$BACKEND" = hc ]; then
     fm_backend_hc_kill "$RELAUNCH_TARGET" '' "$W" || exit 1
-    HC_TERMINAL=$(fm_backend_hc_create_task "$HC_SES" "$W" "$WT") || exit 1
+    HC_TERMINAL=$(fm_backend_hc_create_task "$HC_SES" "$W" "$WT" "$KIND") || exit 1
     T="$HC_SES:$HC_TERMINAL"
     WT_TARGET=$T
     SES=$HC_SES
@@ -5136,7 +5136,7 @@ EOF
   hc)
     HC_SES=$(fm_backend_hc_container_ensure) || exit 1
     HC_CORE_ID=$(fm_backend_hc_core_id "$HC_SES") || { echo "error: cannot bind hc core identity" >&2; exit 1; }
-    HC_TERMINAL=$(fm_backend_hc_create_task "$HC_SES" "$W" "$PROJ_ABS") || exit 1
+    HC_TERMINAL=$(fm_backend_hc_create_task "$HC_SES" "$W" "$PROJ_ABS" "$KIND") || exit 1
     T="$HC_SES:$HC_TERMINAL"
     ;;
   orca)

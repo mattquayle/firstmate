@@ -34,6 +34,12 @@ hc stamps `HC_TERMINAL_ID` into every process an hc terminal starts, including a
 ## Task shape and metadata
 
 Each task is one hc terminal running the user's login shell in the project directory.
+New terminals receive a readable lowercase slug derived from the task ID and role, with a home/task suffix for uniqueness.
+For example, a Factory secondmate receives `factory-supervisor-<suffix>` and an issue priority review task receives `issue-priority-review-<suffix>`.
+The [adapter header](../bin/backends/hc.sh) owns name derivation and collision refusal.
+The core name is separate from ownership labels and addresses.
+Herdr's nested-row source prefers that name over the template or program name; terminal titles do not supply that row's label.
+The [verification record](verification/runtime-backends.md#native-agent-names) distinguishes real-core proof from unobserved UI rendering.
 A verified supervisor becomes its native hc parent, allowing clients such as Herdr to show nested agents.
 Every launch retains `--outlive-parent --no-notify`, so a parent's exit or removal neither stops its children nor types unsolicited notes into the parent.
 The terminal carries these labels:
@@ -126,6 +132,9 @@ Existing attachment views and legacy endpoints are not adopted or migrated autom
 - hc reports one foreground process per terminal.
   When that process is a launcher, the adapter also reads the rest of its process group from `ps`, which works only for terminals on the local machine.
 - Right after a terminal starts, `hc get` can report no foreground process yet, and agent state reads `unreadable` until the shell is up.
+- Core terminal names are lowercase slugs, not arbitrary human text with spaces.
+  The installed core supports setting the name only at creation, so existing busy agents keep their current names until an ordinary future replacement.
+  There is no supported in-place terminal rename recipe; changing titles or ownership labels does not rename nested rows.
 - Remote hc secondmates are unsupported.
 - A worker inherits `HC_SESSION`, `HC_TERMINAL_ID`, `HC_TERMINAL_SOCKET`, and `HC_SCOPE` from its terminal, and the `config/launch-env-allowlist` floor keeps them; Codex native status and actual tool context are covered by the credentialed lifecycle guard below.
   Native secondmate lifecycle for other harnesses is not live-verified by that guard.
